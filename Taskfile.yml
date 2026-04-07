@@ -1,0 +1,35 @@
+version: 3
+
+vars:
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the project
+    cmds:
+      - go build -o env-vault{{exeExt}} ./cmd/cli
+
+  demo:
+    desc: Run the demo program that prints environment variables
+    cmds:
+      - go run ./cmd/demo
+
+  format:
+    desc: Format Go code
+    cmds:
+      - go fix ./...
+      - go fmt ./...
+
+  lint:
+    desc: Run golangci-lint in a Docker container
+    cmds:
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app golangci/golangci-lint:v2.11.4 golangci-lint run -v --timeout 5m
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test -v ./...
