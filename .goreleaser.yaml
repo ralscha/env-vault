@@ -15,11 +15,24 @@ builds:
     goarch:
       - amd64
       - arm64
+  - id: env-vault-tui
+    main: ./cmd/tui
+    binary: env-vault-tui
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
 
 archives:
   - id: binaries
     ids:
       - env-vault
+      - env-vault-tui
     formats:
       - tar.gz
     name_template: '{{ trimsuffix .Binary ".exe" }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'

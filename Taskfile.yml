@@ -12,6 +12,7 @@ tasks:
     desc: Build the project
     cmds:
       - go build -o env-vault{{exeExt}} ./cmd/cli
+      - go build -o env-vault-tui{{exeExt}} ./cmd/tui
 
   demo:
     desc: Run the demo program that prints environment variables

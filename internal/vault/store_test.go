@@ -233,6 +233,55 @@ func TestSetRejectsConflictingNameKinds(t *testing.T) {
 	}
 }
 
+func TestCreateNameCreatesEmptyEntities(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(filepath.Join(dir, "vault"))
+	password := []byte("password-one")
+	if _, err := store.Init(password, 14); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	opened, err := store.Open(password)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer opened.Close()
+
+	if err := opened.CreateName(EntityKindGroup, "shared"); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := opened.CreateName(EntityKindApp, "chat"); err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+
+	if err := opened.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	if got := opened.Kind("shared"); got != EntityKindGroup {
+		t.Fatalf("unexpected group kind: %q", got)
+	}
+	if got := opened.Kind("chat"); got != EntityKindApp {
+		t.Fatalf("unexpected app kind: %q", got)
+	}
+
+	keys, err := opened.ListKeys("shared")
+	if err != nil {
+		t.Fatalf("list group keys: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("expected no direct group keys, got %#v", keys)
+	}
+
+	app, err := opened.App("chat")
+	if err != nil {
+		t.Fatalf("app: %v", err)
+	}
+	if len(app.Env) != 0 || len(app.Groups) != 0 {
+		t.Fatalf("expected empty app, got %#v", app)
+	}
+}
+
 func TestResolveSelectionHonorsSelectorOrder(t *testing.T) {
 	file := NewFile()
 	file.Groups["base"] = Profile{"TOKEN": []byte("base")}

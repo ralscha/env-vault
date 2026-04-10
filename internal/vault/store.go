@@ -476,6 +476,27 @@ func (o *Opened) CopyName(sourceName, destinationName string) (EntityKind, error
 	return kind, o.file.Validate()
 }
 
+func (o *Opened) CreateName(kind EntityKind, name string) error {
+	if o.file.HasName(name) {
+		return fmt.Errorf("%w: %s", ErrNameInUse, name)
+	}
+
+	now := time.Now().UTC()
+	switch kind {
+	case EntityKindGroup:
+		o.file.Groups[name] = Profile{}
+	case EntityKindApp:
+		o.file.Apps[name] = App{Groups: []string{}, Env: Profile{}}
+	case EntityKindUnknown:
+		return fmt.Errorf("unsupported entity kind %q", kind)
+	default:
+		return fmt.Errorf("unsupported entity kind %q", kind)
+	}
+
+	o.file.SetMetadata(name, EntityMetadata{CreatedAt: now, ModifiedAt: now})
+	return o.file.Validate()
+}
+
 func (o *Opened) Kind(name string) EntityKind {
 	return o.file.Kind(name)
 }

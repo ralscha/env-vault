@@ -10,7 +10,36 @@ Build from source:
 git clone https://github.com/ralscha/env-vault
 cd env-vault
 go build -o env-vault ./cmd/cli
+go build -o env-vault-tui ./cmd/tui
 ```
+
+The CLI and TUI ship as separate binaries. Use `env-vault` for scripting and `env-vault-tui` for interactive management.
+
+## TUI
+
+The TUI is optimized for day-to-day vault management with an explorer-like layout:
+
+- Searchable entity list on the left for apps and groups.
+- Detail pane on the right with direct keys, linked groups, and a resolved preview.
+- Modal forms for creating entities, editing keys, linking groups, renaming, copying, and removing entries.
+
+Run it with the same vault-location and password flags as the CLI:
+
+```sh
+env-vault-tui
+env-vault-tui --dir ~/.config/my-vault
+printf '%s' "$ENV_VAULT_PASSWORD" | env-vault-tui --password-stdin
+```
+
+Inside the TUI:
+
+- `/` filters by entity name, kind, key name, or linked group.
+- `n` creates an app or group.
+- `a` adds or updates a direct key.
+- `d` removes a direct key.
+- `l` and `u` link or unlink groups on the selected app.
+- `r`, `y`, and `x` rename, copy, or remove the selected entity.
+- `v` toggles secret visibility in the detail pane.
 
 ## Concepts
 
