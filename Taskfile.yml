@@ -1,7 +1,5 @@
 version: 3
 
-vars:
-
 tasks:
   default:
     desc: Show available tasks
