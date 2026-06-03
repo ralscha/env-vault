@@ -141,7 +141,7 @@ env-vault set --group llm OPENAI_API_KEY
 env-vault set --group --interactive llm
 
 # Read value from stdin
-echo "sk-abc123" | env-vault set --group llm OPENAI_API_KEY --stdin
+echo "sk-abc123" | env-vault set --stdin --group llm OPENAI_API_KEY
 
 # Inline value (shell history risk)
 env-vault set --group remotedb DB_HOST db.example.com
@@ -260,7 +260,7 @@ env-vault show [shared flags] [--resolved] [--json] [app|group] NAME[,NAME...]
 env-vault show group llm
 env-vault show app chat
 env-vault show --resolved chat
-env-vault show --json chat,llm
+env-vault show --resolved --json chat,llm
 env-vault inspect group llm
 ```
 
@@ -310,7 +310,7 @@ Delete an app or group entirely.
 env-vault remove [shared flags] [--force] NAME
 ```
 
-Prompts for confirmation unless `--force` is given. Removing a group does not automatically unlink it from apps that reference it.
+Prompts for confirmation unless `--force` is given. Removing a group automatically unlinks it from apps that reference it.
 
 ```sh
 env-vault remove old-app
@@ -360,8 +360,8 @@ env-vault export [shared flags] [--format env|export-env|json|dotenv] [--metadat
 
 | Format | Output |
 |---|---|
-| `env` | `KEY="value"` lines |
-| `export-env` | `export KEY="value"` lines for POSIX shell sourcing |
+| `env` | POSIX-safe `KEY='value'` lines |
+| `export-env` | POSIX-safe `export KEY='value'` lines for shell sourcing |
 | `json` | flat JSON object |
 | `dotenv` | `.env`-style `KEY="value"` lines |
 

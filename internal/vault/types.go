@@ -78,6 +78,19 @@ func (p Profile) Wipe() {
 	}
 }
 
+func ValidateEnvKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("key names cannot be empty")
+	}
+	for index, r := range key {
+		valid := r == '_' || ('A' <= r && r <= 'Z') || ('a' <= r && r <= 'z') || (index > 0 && '0' <= r && r <= '9')
+		if !valid {
+			return fmt.Errorf("invalid environment variable key %q", key)
+		}
+	}
+	return nil
+}
+
 type File struct {
 	Version  int                       `json:"version"`
 	Groups   map[string]Profile        `json:"groups"`
@@ -222,7 +235,19 @@ func (f *File) Validate() error {
 		if app.Env == nil {
 			app.Env = Profile{}
 		}
+		for key := range app.Env {
+			if err := ValidateEnvKey(key); err != nil {
+				return err
+			}
+		}
 		f.Apps[appName] = app
+	}
+	for groupName, profile := range f.Groups {
+		for key := range profile {
+			if err := ValidateEnvKey(key); err != nil {
+				return fmt.Errorf("group %q: %w", groupName, err)
+			}
+		}
 	}
 	return nil
 }

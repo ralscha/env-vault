@@ -85,6 +85,15 @@ func (b *FileBackend) Save(ctx context.Context, kind BlobKind, blob Blob, opts S
 	if err != nil {
 		return "", err
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+
+	unlock, err := lockFile(path + ".lock")
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 
 	exists, currentVersion, err := b.Stat(ctx, kind)
 	if err != nil {

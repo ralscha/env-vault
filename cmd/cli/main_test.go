@@ -106,35 +106,41 @@ func TestRenderExportEnvFormats(t *testing.T) {
 		"BETA":  []byte("line1\nline2"),
 	}
 
-	tests := map[string][]string{
-		"env": {
-			`ALPHA="one two"`,
-			`BETA="line1\nline2"`,
-		},
-		"dotenv": {
-			`ALPHA="one two"`,
-			`BETA="line1\nline2"`,
-		},
-		"export-env": {
-			`export ALPHA="one two"`,
-			`export BETA="line1\nline2"`,
-		},
+	tests := map[string]string{
+		"env":        "ALPHA='one two'\nBETA='line1\nline2'\n",
+		"dotenv":     "ALPHA=\"one two\"\nBETA=\"line1\\nline2\"\n",
+		"export-env": "export ALPHA='one two'\nexport BETA='line1\nline2'\n",
 	}
 
-	for format, wantLines := range tests {
+	for format, want := range tests {
 		got, err := renderExport(profile, format)
 		if err != nil {
 			t.Fatalf("renderExport(%q) returned error: %v", format, err)
 		}
-		gotLines := strings.Split(strings.TrimSpace(string(got)), "\n")
-		if len(gotLines) != len(wantLines) {
-			t.Fatalf("renderExport(%q) returned %d lines, want %d", format, len(gotLines), len(wantLines))
+		if string(got) != want {
+			t.Fatalf("renderExport(%q) = %q, want %q", format, got, want)
 		}
-		for index, want := range wantLines {
-			if gotLines[index] != want {
-				t.Fatalf("renderExport(%q) line %d = %q, want %q", format, index, gotLines[index], want)
-			}
-		}
+	}
+}
+
+func TestRenderExportEnvShellQuotesDangerousValues(t *testing.T) {
+	profile := vault.Profile{
+		"DANGEROUS": []byte("$(touch pwned)'`"),
+	}
+
+	got, err := renderExport(profile, "export-env")
+	if err != nil {
+		t.Fatalf("renderExport() error = %v", err)
+	}
+	want := "export DANGEROUS='$(touch pwned)'\\''`'\n"
+	if string(got) != want {
+		t.Fatalf("renderExport() = %q, want %q", got, want)
+	}
+}
+
+func TestRenderExportRejectsInvalidKeys(t *testing.T) {
+	if _, err := renderExport(vault.Profile{"BAD-NAME": []byte("value")}, "export-env"); err == nil {
+		t.Fatal("expected invalid env key to fail")
 	}
 }
 

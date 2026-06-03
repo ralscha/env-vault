@@ -201,6 +201,9 @@ func (o *Opened) Save() error {
 }
 
 func (o *Opened) SetGroup(groupName, key string, value []byte) error {
+	if err := ValidateEnvKey(key); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	switch o.file.Kind(groupName) {
 	case EntityKindUnknown:
@@ -221,6 +224,9 @@ func (o *Opened) SetGroup(groupName, key string, value []byte) error {
 }
 
 func (o *Opened) SetApp(appName, key string, value []byte) error {
+	if err := ValidateEnvKey(key); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	switch o.file.Kind(appName) {
 	case EntityKindUnknown:

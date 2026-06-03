@@ -672,14 +672,18 @@ func runList(args []string) error {
 }
 
 func runSet(args []string) error {
+	args, preReadFromStdin := extractBoolFlag(args, "--stdin")
+	args, preInteractive := extractBoolFlag(args, "--interactive")
+	args, preAsApp := extractBoolFlag(args, "--app")
+	args, preAsGroup := extractBoolFlag(args, "--group")
 	fs := flag.NewFlagSet("set", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	dir := fs.String("dir", defaultVaultDir(), "vault directory")
 	unlock := addUnlockFlags(fs)
-	readFromStdin := fs.Bool("stdin", false, "read value from standard input")
-	interactive := fs.Bool("interactive", false, "prompt for multiple key/value pairs")
-	asApp := fs.Bool("app", false, "set a direct app env var")
-	asGroup := fs.Bool("group", false, "set a group env var")
+	readFromStdin := fs.Bool("stdin", preReadFromStdin, "read value from standard input")
+	interactive := fs.Bool("interactive", preInteractive, "prompt for multiple key/value pairs")
+	asApp := fs.Bool("app", preAsApp, "set a direct app env var")
+	asGroup := fs.Bool("group", preAsGroup, "set a group env var")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1404,7 +1408,10 @@ func renderExport(profile vault.Profile, format string) ([]byte, error) {
 	case "env", "dotenv", "export-env":
 		lines := make([]string, 0, len(keys))
 		for _, key := range keys {
-			assignment := key + "=" + strconv.Quote(string(profile[key]))
+			if err := vault.ValidateEnvKey(key); err != nil {
+				return nil, err
+			}
+			assignment := key + "=" + quoteExportValue(string(profile[key]), format)
 			if format == "export-env" {
 				assignment = "export " + assignment
 			}
@@ -1427,6 +1434,20 @@ func renderExport(profile vault.Profile, format string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported export format %q", format)
 	}
+}
+
+func quoteExportValue(value, format string) string {
+	if format == "dotenv" {
+		return strconv.Quote(value)
+	}
+	return quotePOSIXShell(value)
+}
+
+func quotePOSIXShell(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 func extractBoolFlag(args []string, flagName string) ([]string, bool) {
@@ -1984,8 +2005,8 @@ func normalizeEditableKeys(keys map[string]string) (map[string]string, error) {
 	normalized := make(map[string]string, len(keys))
 	for key, value := range keys {
 		key = strings.TrimSpace(key)
-		if key == "" {
-			return nil, fmt.Errorf("key names cannot be empty")
+		if err := vault.ValidateEnvKey(key); err != nil {
+			return nil, err
 		}
 		normalized[key] = value
 	}
