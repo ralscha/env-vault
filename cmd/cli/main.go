@@ -1910,8 +1910,8 @@ func metadataTimeValue(value time.Time) string {
 }
 
 func editEntityInEditor(name string, kind vault.EntityKind, directKeys map[string]string, editorOverride string) (editableMetadata, bool, error) {
-	original := editableMetadata{}
-	original.Keys = cloneStringMap(directKeys)
+	original := editableMetadata{
+		Keys: cloneStringMap(directKeys)}
 	contents, err := renderEditableEntity(original)
 	if err != nil {
 		return editableMetadata{}, false, err
@@ -2459,8 +2459,7 @@ func runChildProcess(cmd *exec.Cmd) error {
 		return nil
 	}
 
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 			os.Exit(status.ExitStatus())
 		}
