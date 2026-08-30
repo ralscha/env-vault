@@ -3,7 +3,7 @@ module env-vault
 go 1.27.0
 
 require (
-	filippo.io/age v1.3.1
+	filippo.io/age v1.3.2
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/awnumar/memguard v0.23.0
 	github.com/charmbracelet/bubbles v1.0.0
