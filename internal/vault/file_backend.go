@@ -57,6 +57,21 @@ func (b *FileBackend) Load(ctx context.Context, kind BlobKind) (Blob, error) {
 	if err != nil {
 		return Blob{}, err
 	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Blob{}, ErrNotInitialized
+		}
+		return Blob{}, err
+	}
+
+	// Hold the same lock as Save so the bytes and version always describe the
+	// same file generation. Without it, a rename between ReadFile and Stat can
+	// make an old payload appear current and defeat optimistic concurrency.
+	unlock, err := lockFile(path + ".lock")
+	if err != nil {
+		return Blob{}, err
+	}
+	defer unlock()
 
 	// #nosec G304 -- backend paths are derived from the configured vault directory and blob kind.
 	data, err := os.ReadFile(path)

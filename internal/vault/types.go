@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strings"
 	"time"
+	"unicode"
 )
 
 const currentVersion = 1
@@ -86,6 +88,26 @@ func ValidateEnvKey(key string) error {
 		valid := r == '_' || ('A' <= r && r <= 'Z') || ('a' <= r && r <= 'z') || (index > 0 && '0' <= r && r <= '9')
 		if !valid {
 			return fmt.Errorf("invalid environment variable key %q", key)
+		}
+	}
+	return nil
+}
+
+// ValidateEntityName keeps names compatible with comma-separated selections
+// and safe to render in terminal-oriented clients.
+func ValidateEntityName(name string) error {
+	if name == "" {
+		return fmt.Errorf("entity names cannot be empty")
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("entity name %q cannot start or end with whitespace", name)
+	}
+	if strings.ContainsRune(name, ',') {
+		return fmt.Errorf("entity name %q cannot contain a comma", name)
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("entity name %q cannot contain control characters", name)
 		}
 	}
 	return nil

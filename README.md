@@ -47,6 +47,8 @@ Inside the TUI:
 
 Both apps and groups live in one flat namespace — names must be unique across both kinds.
 
+Names may contain spaces, but not leading or trailing whitespace, commas, or control characters. Commas are reserved for selections.
+
 **Selections** are comma-separated lists of app and/or group names. They are merged left to right: later entries override earlier ones. Within an app, group values are applied in link order, then the app's own variables are applied last.
 
 The vault is encrypted on disk using [age](https://age-encryption.org) with a post-quantum hybrid recipient. The master password protects a separate encrypted age identity file using age scrypt. Neither file is readable without the password.
@@ -146,6 +148,21 @@ echo "sk-abc123" | env-vault set --stdin --group llm OPENAI_API_KEY
 # Inline value (shell history risk)
 env-vault set --group remotedb DB_HOST db.example.com
 env-vault set --app chat MODEL gpt-4o
+```
+
+---
+
+### `create`
+
+Create an empty app or group. This is useful when you want to establish the vault structure before adding keys or links.
+
+```
+env-vault create [shared flags] app|group NAME
+```
+
+```sh
+env-vault create group shared
+env-vault create app chat
 ```
 
 ---

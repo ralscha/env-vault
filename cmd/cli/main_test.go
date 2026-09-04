@@ -64,10 +64,20 @@ func TestBuildShellEnvMarksShellSession(t *testing.T) {
 	}
 }
 
+func TestEnvironmentKeyComparisonMatchesPlatformRules(t *testing.T) {
+	if environmentKeysEqual("linux", "TOKEN", "token") {
+		t.Fatal("expected Unix environment keys to be case-sensitive")
+	}
+	if !environmentKeysEqual(goosWindows, "Path", "PATH") {
+		t.Fatal("expected Windows environment keys to be case-insensitive")
+	}
+}
+
 func TestCanonicalCommandAliases(t *testing.T) {
 	tests := map[string]string{
 		"completion": "completion",
 		"copy":       "copy",
+		"create":     "create",
 		"edit":       "edit",
 		"export":     "export",
 		"inspect":    "show",
@@ -191,6 +201,9 @@ func TestRenderCompletionIncludesKnownCommands(t *testing.T) {
 		}
 		if !strings.Contains(rendered, "unlock") || !strings.Contains(rendered, test.flagNeedle) {
 			t.Fatalf("%s: expected completion output to contain known commands and flags", test.name)
+		}
+		if !strings.Contains(rendered, "create") || !strings.Contains(rendered, "group") {
+			t.Fatalf("%s: expected completion output to include create subcommands", test.name)
 		}
 		if strings.Contains(rendered, "annotate") || strings.Contains(rendered, "tag") {
 			t.Fatalf("%s: removed commands should not appear in completion output", test.name)

@@ -29,6 +29,7 @@ const (
 	unlockActionIdentity     = "identity"
 	unlockActionStatus       = "status"
 	unlockActionAudit        = "audit"
+	unlockActionExtend       = "extend"
 	unlockActionShutdown     = "shutdown"
 	unlockAuditEventLimit    = 12
 )
@@ -51,9 +52,10 @@ type unlockTransport struct {
 }
 
 type unlockRequest struct {
-	Action string            `json:"action"`
-	Token  string            `json:"token"`
-	Event  *unlockAuditEvent `json:"event,omitempty"`
+	Action   string            `json:"action"`
+	Token    string            `json:"token"`
+	Event    *unlockAuditEvent `json:"event,omitempty"`
+	ExtendBy time.Duration     `json:"extend_by,omitempty"`
 }
 
 type unlockResponse struct {
@@ -66,6 +68,9 @@ type unlockResponse struct {
 type unlockWindowState struct {
 	identity    *age.HybridIdentity
 	auditEvents []unlockAuditEvent
+	lease       *unlockLease
+	leasePath   string
+	expiryTimer *time.Timer
 }
 
 type unlockStatusInfo struct {
@@ -207,14 +212,18 @@ func runUnlockHelper(args []string) error {
 		return err
 	}
 	defer func() {
-		_ = os.Remove(leasePath)
+		_ = removeUnlockLease(leasePath, lease.Token)
 	}()
-	expiryTimer := time.AfterFunc(time.Until(lease.ExpiresAt), func() {
+	state := &unlockWindowState{
+		identity:  identity,
+		lease:     &lease,
+		leasePath: leasePath,
+	}
+	state.expiryTimer = time.AfterFunc(time.Until(lease.ExpiresAt), func() {
 		_ = listener.Close()
 	})
-	defer expiryTimer.Stop()
+	defer state.expiryTimer.Stop()
 
-	state := &unlockWindowState{identity: identity}
 	shutdown := false
 	for !shutdown {
 		conn, err := listener.Accept()
@@ -227,12 +236,12 @@ func runUnlockHelper(args []string) error {
 			}
 			return err
 		}
-		shutdown = serveUnlockWindowConn(conn, lease, state)
+		shutdown = serveUnlockWindowConn(conn, state)
 	}
 	return nil
 }
 
-func serveUnlockWindowConn(conn net.Conn, lease unlockLease, state *unlockWindowState) bool {
+func serveUnlockWindowConn(conn net.Conn, state *unlockWindowState) bool {
 	defer func() {
 		_ = conn.Close()
 	}()
@@ -247,17 +256,19 @@ func serveUnlockWindowConn(conn net.Conn, lease unlockLease, state *unlockWindow
 		_ = encoder.Encode(unlockResponse{Error: fmt.Sprintf("decode request: %v", err)})
 		return false
 	}
-	if request.Token != lease.Token {
+	if request.Token != state.lease.Token {
 		_ = encoder.Encode(unlockResponse{Error: "unauthorized"})
 		return false
 	}
 
 	switch request.Action {
 	case unlockActionIdentity:
-		_ = encoder.Encode(unlockResponse{Identity: vault.MarshalIdentity(state.identity), ExpiresAt: lease.ExpiresAt})
+		identity := vault.MarshalIdentity(state.identity)
+		_ = encoder.Encode(unlockResponse{Identity: identity, ExpiresAt: state.lease.ExpiresAt})
+		vault.Wipe(identity)
 		return false
 	case unlockActionStatus:
-		_ = encoder.Encode(unlockResponse{ExpiresAt: lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)})
+		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)})
 		return false
 	case unlockActionAudit:
 		if request.Event == nil || request.Event.Command == "" {
@@ -265,10 +276,33 @@ func serveUnlockWindowConn(conn net.Conn, lease unlockLease, state *unlockWindow
 			return false
 		}
 		state.auditEvents = appendUnlockAuditEvent(state.auditEvents, *request.Event)
-		_ = encoder.Encode(unlockResponse{ExpiresAt: lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)})
+		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)})
+		return false
+	case unlockActionExtend:
+		if request.ExtendBy <= 0 {
+			_ = encoder.Encode(unlockResponse{Error: "extension duration must be greater than zero"})
+			return false
+		}
+		extendedExpiry := time.Now().UTC().Add(request.ExtendBy)
+		if extendedExpiry.After(state.lease.ExpiresAt) {
+			if !state.expiryTimer.Stop() {
+				_ = encoder.Encode(unlockResponse{Error: "unlock window has expired"})
+				return false
+			}
+			previousExpiry := state.lease.ExpiresAt
+			state.lease.ExpiresAt = extendedExpiry
+			if err := writeUnlockLease(state.leasePath, *state.lease); err != nil {
+				state.lease.ExpiresAt = previousExpiry
+				state.expiryTimer.Reset(max(time.Until(previousExpiry), time.Nanosecond))
+				_ = encoder.Encode(unlockResponse{Error: fmt.Sprintf("persist extension: %v", err)})
+				return false
+			}
+			state.expiryTimer.Reset(time.Until(extendedExpiry))
+		}
+		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt})
 		return false
 	case unlockActionShutdown:
-		_ = encoder.Encode(unlockResponse{ExpiresAt: lease.ExpiresAt})
+		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt})
 		return true
 	default:
 		_ = encoder.Encode(unlockResponse{Error: fmt.Sprintf("unsupported action %q", request.Action)})
@@ -281,6 +315,13 @@ func withOpenedStore(dir string, unlock unlockOptions, audit unlockAuditEvent, f
 	opened, err := openStoreWithUnlockWindow(store)
 	if err == nil {
 		defer opened.Close()
+		if unlock.unlockWindow > 0 {
+			if err := extendUnlockWindow(store.Dir(), unlock.unlockWindow); err != nil {
+				if writeErr := writeTextf(os.Stderr, "Warning: failed to extend unlock window for %s: %v\n", dir, err); writeErr != nil {
+					return writeErr
+				}
+			}
+		}
 		if err := fn(opened); err != nil {
 			return err
 		}
@@ -365,11 +406,11 @@ func withUnlockWindowLease(dir string, fn func(unlockLease, string) error) error
 		return err
 	}
 	if lease.Version != unlockLeaseVersion {
-		_ = os.Remove(leasePath)
+		_ = removeUnlockLease(leasePath, lease.Token)
 		return errNoUnlockWindow
 	}
 	if time.Now().After(lease.ExpiresAt) {
-		_ = os.Remove(leasePath)
+		_ = removeUnlockLease(leasePath, lease.Token)
 		return errNoUnlockWindow
 	}
 	return fn(lease, leasePath)
@@ -381,12 +422,12 @@ func fetchIdentityFromUnlockWindow(dir string) ([]byte, unlockLease, error) {
 	err := withUnlockWindowLease(dir, func(candidate unlockLease, leasePath string) error {
 		response, err := requestUnlockHelper(candidate, unlockActionIdentity, nil)
 		if err != nil {
-			_ = os.Remove(leasePath)
+			_ = removeUnlockLease(leasePath, candidate.Token)
 			return errNoUnlockWindow
 		}
 		if response.Error != "" {
 			if response.Error == "unauthorized" {
-				_ = os.Remove(leasePath)
+				_ = removeUnlockLease(leasePath, candidate.Token)
 			}
 			return fmt.Errorf("unlock helper: %s", response.Error)
 		}
@@ -405,7 +446,7 @@ func unlockWindowStatus(dir string) (unlockStatusInfo, error) {
 	err := withUnlockWindowLease(dir, func(candidate unlockLease, leasePath string) error {
 		response, err := requestUnlockHelper(candidate, unlockActionStatus, nil)
 		if err != nil {
-			_ = os.Remove(leasePath)
+			_ = removeUnlockLease(leasePath, candidate.Token)
 			return errNoUnlockWindow
 		}
 		if response.Error != "" {
@@ -424,14 +465,19 @@ func unlockWindowStatus(dir string) (unlockStatusInfo, error) {
 func clearUnlockWindow(dir string) (bool, error) {
 	cleared := false
 	err := withUnlockWindowLease(dir, func(lease unlockLease, leasePath string) error {
-		_, err := requestUnlockHelper(lease, unlockActionShutdown, nil)
-		if err != nil && !errors.Is(err, errNoUnlockWindow) {
-			_ = os.Remove(leasePath)
-			return nil
-		}
-		if err := os.Remove(leasePath); err != nil {
+		response, err := requestUnlockHelper(lease, unlockActionShutdown, nil)
+		if err != nil {
+			_ = removeUnlockLease(leasePath, lease.Token)
+			if errors.Is(err, errNoUnlockWindow) {
+				return nil
+			}
 			return err
 		}
+		if response.Error != "" {
+			return fmt.Errorf("unlock helper: %s", response.Error)
+		}
+		// The helper owns the lease and removes it while shutting down. Having
+		// the client remove it too races with that cleanup on Windows.
 		cleared = true
 		return nil
 	})
@@ -448,12 +494,33 @@ func ensureUnlockWindow(dir string, ttl time.Duration, identity *age.HybridIdent
 	if ttl <= 0 {
 		return nil
 	}
-	if _, err := unlockWindowStatus(dir); err == nil {
+	if err := extendUnlockWindow(dir, ttl); err == nil {
 		return nil
 	} else if !errors.Is(err, errNoUnlockWindow) {
 		return err
 	}
 	return startUnlockHelper(dir, ttl, identity)
+}
+
+func extendUnlockWindow(dir string, ttl time.Duration) error {
+	if ttl <= 0 {
+		return nil
+	}
+	return withUnlockWindowLease(dir, func(lease unlockLease, leasePath string) error {
+		response, err := requestUnlockHelperWithRequest(lease, unlockRequest{
+			Action:   unlockActionExtend,
+			Token:    lease.Token,
+			ExtendBy: ttl,
+		})
+		if err != nil {
+			_ = removeUnlockLease(leasePath, lease.Token)
+			return errNoUnlockWindow
+		}
+		if response.Error != "" {
+			return fmt.Errorf("unlock helper: %s", response.Error)
+		}
+		return nil
+	})
 }
 
 func startUnlockHelper(dir string, ttl time.Duration, identity *age.HybridIdentity) error {
@@ -523,6 +590,10 @@ func currentExecutablePath() (string, error) {
 }
 
 func requestUnlockHelper(lease unlockLease, action string, event *unlockAuditEvent) (unlockResponse, error) {
+	return requestUnlockHelperWithRequest(lease, unlockRequest{Action: action, Token: lease.Token, Event: event})
+}
+
+func requestUnlockHelperWithRequest(lease unlockLease, request unlockRequest) (unlockResponse, error) {
 	conn, err := dialUnlockTransport(lease, time.Second)
 	if err != nil {
 		return unlockResponse{}, errNoUnlockWindow
@@ -534,7 +605,6 @@ func requestUnlockHelper(lease unlockLease, action string, event *unlockAuditEve
 		return unlockResponse{}, err
 	}
 
-	request := unlockRequest{Action: action, Token: lease.Token, Event: event}
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
 		return unlockResponse{}, err
 	}
@@ -543,9 +613,16 @@ func requestUnlockHelper(lease unlockLease, action string, event *unlockAuditEve
 		return unlockResponse{}, err
 	}
 	if response.Error != "" {
+		vault.Wipe(response.Identity)
+		response.Identity = nil
 		return response, nil
 	}
-	if time.Now().After(lease.ExpiresAt) {
+	expiresAt := lease.ExpiresAt
+	if !response.ExpiresAt.IsZero() {
+		expiresAt = response.ExpiresAt
+	}
+	if time.Now().After(expiresAt) {
+		vault.Wipe(response.Identity)
 		return unlockResponse{}, errNoUnlockWindow
 	}
 	return response, nil
@@ -558,7 +635,7 @@ func recordUnlockWindowAudit(dir string, event unlockAuditEvent) error {
 	return withUnlockWindowLease(dir, func(lease unlockLease, leasePath string) error {
 		response, err := requestUnlockHelper(lease, unlockActionAudit, &event)
 		if err != nil {
-			_ = os.Remove(leasePath)
+			_ = removeUnlockLease(leasePath, lease.Token)
 			return errNoUnlockWindow
 		}
 		if response.Error != "" {
@@ -616,6 +693,23 @@ func readUnlockLease(path string) (unlockLease, error) {
 		return unlockLease{}, err
 	}
 	return lease, nil
+}
+
+func removeUnlockLease(path, token string) error {
+	lease, err := readUnlockLease(path)
+	if errors.Is(err, errNoUnlockWindow) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if lease.Token != token {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func writeUnlockLease(path string, lease unlockLease) error {

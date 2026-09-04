@@ -201,6 +201,9 @@ func (o *Opened) Save() error {
 }
 
 func (o *Opened) SetGroup(groupName, key string, value []byte) error {
+	if err := ValidateEntityName(groupName); err != nil {
+		return err
+	}
 	if err := ValidateEnvKey(key); err != nil {
 		return err
 	}
@@ -224,6 +227,9 @@ func (o *Opened) SetGroup(groupName, key string, value []byte) error {
 }
 
 func (o *Opened) SetApp(appName, key string, value []byte) error {
+	if err := ValidateEntityName(appName); err != nil {
+		return err
+	}
 	if err := ValidateEnvKey(key); err != nil {
 		return err
 	}
@@ -248,6 +254,12 @@ func (o *Opened) SetApp(appName, key string, value []byte) error {
 }
 
 func (o *Opened) LinkAppGroup(appName, groupName string) error {
+	if err := ValidateEntityName(appName); err != nil {
+		return err
+	}
+	if err := ValidateEntityName(groupName); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	if _, ok := o.file.Groups[groupName]; !ok {
 		return ErrGroupNotFound
@@ -411,6 +423,9 @@ func (o *Opened) Metadata(name string) (EntityMetadata, error) {
 }
 
 func (o *Opened) RenameName(oldName, newName string) (EntityKind, error) {
+	if err := ValidateEntityName(newName); err != nil {
+		return EntityKindUnknown, err
+	}
 	kind := o.file.Kind(oldName)
 	if kind == EntityKindUnknown {
 		return EntityKindUnknown, ErrNameNotFound
@@ -458,6 +473,9 @@ func (o *Opened) RenameName(oldName, newName string) (EntityKind, error) {
 }
 
 func (o *Opened) CopyName(sourceName, destinationName string) (EntityKind, error) {
+	if err := ValidateEntityName(destinationName); err != nil {
+		return EntityKindUnknown, err
+	}
 	kind := o.file.Kind(sourceName)
 	if kind == EntityKindUnknown {
 		return EntityKindUnknown, ErrNameNotFound
@@ -483,6 +501,9 @@ func (o *Opened) CopyName(sourceName, destinationName string) (EntityKind, error
 }
 
 func (o *Opened) CreateName(kind EntityKind, name string) error {
+	if err := ValidateEntityName(name); err != nil {
+		return err
+	}
 	if o.file.HasName(name) {
 		return fmt.Errorf("%w: %s", ErrNameInUse, name)
 	}
@@ -559,8 +580,8 @@ func ParseSelection(spec string) ([]string, error) {
 	names := make([]string, 0, len(parts))
 	for _, part := range parts {
 		name := strings.TrimSpace(part)
-		if name == "" {
-			return nil, fmt.Errorf("invalid empty name in selection %q", spec)
+		if err := ValidateEntityName(name); err != nil {
+			return nil, fmt.Errorf("invalid name in selection %q: %w", spec, err)
 		}
 		names = append(names, name)
 	}

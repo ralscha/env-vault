@@ -302,6 +302,43 @@ func TestResolveSelectionHonorsSelectorOrder(t *testing.T) {
 	}
 }
 
+func TestValidateEntityName(t *testing.T) {
+	for _, name := range []string{"chat", "production api", "日本語"} {
+		if err := ValidateEntityName(name); err != nil {
+			t.Errorf("ValidateEntityName(%q) returned error: %v", name, err)
+		}
+	}
+
+	for _, name := range []string{"", " chat", "chat ", "chat,api", "chat\napi", "chat\x1bapi"} {
+		if err := ValidateEntityName(name); err == nil {
+			t.Errorf("ValidateEntityName(%q) unexpectedly succeeded", name)
+		}
+	}
+}
+
+func TestEntityMutationsRejectUnselectableNames(t *testing.T) {
+	opened := &Opened{file: NewFile()}
+	if err := opened.CreateName(EntityKindGroup, "shared,prod"); err == nil {
+		t.Fatal("expected comma-containing name to be rejected")
+	}
+	if err := opened.SetApp(" chat", "TOKEN", []byte("secret")); err == nil {
+		t.Fatal("expected whitespace-prefixed name to be rejected")
+	}
+	if len(opened.ListNames()) != 0 {
+		t.Fatalf("invalid mutations changed the vault: %#v", opened.ListNames())
+	}
+}
+
+func TestParseSelectionAllowsSeparatorWhitespace(t *testing.T) {
+	names, err := ParseSelection("chat, shared")
+	if err != nil {
+		t.Fatalf("ParseSelection returned error: %v", err)
+	}
+	if len(names) != 2 || names[0] != "chat" || names[1] != "shared" {
+		t.Fatalf("unexpected parsed names: %#v", names)
+	}
+}
+
 func TestLoadFileReadsInitialVersion(t *testing.T) {
 	payload, err := json.Marshal(struct {
 		Version int                `json:"version"`

@@ -37,6 +37,7 @@ const (
 	commandInit        = "init"
 	commandUnlock      = "unlock"
 	commandShow        = "show"
+	commandCreate      = "create"
 	commandLink        = "link"
 	commandList        = "list"
 	commandSet         = "set"
@@ -121,6 +122,8 @@ func run(args []string) error {
 		return runUnlock(args[1:])
 	case commandShow:
 		return runShow(args[1:])
+	case commandCreate:
+		return runCreate(args[1:])
 	case commandLink:
 		return runLink(args[1:])
 	case commandList:
@@ -201,6 +204,8 @@ Commands:
 	  List entities or keys for a resolved selection.
 	show [shared flags] [--resolved] [--json] [app|group] NAME[,NAME...]
 	  Show one entity or a resolved selection.
+	create [shared flags] app|group NAME
+	  Create an empty app or group.
 	set [shared flags] [--stdin|--interactive] [--app|--group] NAME [KEY [VALUE]]
 	  Set one key or start an interactive edit session.
 	link [shared flags] APP GROUP
@@ -236,8 +241,8 @@ Notes:
 	- set --interactive prompts for multiple keys in one session.
 	- set --stdin reads the value from standard input.
 	- unset and remove prompt for confirmation unless --force is used.
-		- shell marks the child shell session and refuses nested env-vault shells by default.
-		- active unlock helpers are reused automatically; --unlock-window is only needed to start or extend one.
+	- shell marks the child shell session and refuses nested env-vault shells by default.
+	- active unlock helpers are reused automatically; --unlock-window is only needed to start or extend one.
 `)
 }
 
@@ -274,6 +279,8 @@ func canonicalCommand(name string) (string, bool) {
 		return commandList, true
 	case commandShow, "inspect":
 		return commandShow, true
+	case commandCreate:
+		return commandCreate, true
 	case commandSet:
 		return commandSet, true
 	case commandRename:
@@ -346,6 +353,7 @@ func completionCommands() []string {
 		"ls",
 		"show",
 		"inspect",
+		"create",
 		"set",
 		"link",
 		"rename",
@@ -366,6 +374,7 @@ func completionSubcommands() map[string][]string {
 		"unlock":     {"status", "clear"},
 		"show":       {"app", "group"},
 		"inspect":    {"app", "group"},
+		"create":     {"app", "group"},
 	}
 }
 
@@ -386,6 +395,7 @@ func completionFlags() map[string][]string {
 		"edit":       append(append([]string{}, unlockFlags...), "--editor"),
 		"show":       showFlags,
 		"inspect":    showFlags,
+		"create":     unlockFlags,
 		"set":        setFlags,
 		"link":       unlockFlags,
 		"rename":     unlockFlags,
@@ -615,26 +625,29 @@ func runList(args []string) error {
 	if err := unlock.Validate(); err != nil {
 		return err
 	}
+	if fs.NArg() > 1 {
+		return fmt.Errorf("list accepts at most one selection")
+	}
 
 	target := ""
 	if fs.NArg() == 1 {
 		target = fs.Arg(0)
 	}
 	return withOpenedStore(*dir, *unlock, newUnlockAuditEvent("list", target), func(opened *vault.Opened) error {
-		entries, err := buildListInventory(opened)
-		if err != nil {
-			return err
-		}
-		if jsonOutput {
-			if fs.NArg() == 0 {
-				payload, err := renderListInventoryJSON(entries)
+		if fs.NArg() == 1 {
+			if !jsonOutput {
+				profile, err := opened.ResolveSelection(fs.Arg(0))
 				if err != nil {
 					return err
 				}
-				return writeText(os.Stdout, string(payload))
-			}
-			if fs.NArg() > 1 {
-				return fmt.Errorf("list accepts at most one selection")
+				defer opened.WipeProfile(profile)
+
+				for _, key := range profile.Keys() {
+					if err := writeLine(os.Stdout, key); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 			payload, err := renderListSelectionJSON(opened, fs.Arg(0))
 			if err != nil {
@@ -642,28 +655,20 @@ func runList(args []string) error {
 			}
 			return writeText(os.Stdout, string(payload))
 		}
-		if fs.NArg() == 0 {
-			for _, entry := range entries {
-				line := formatListEntityLine(entry)
-				if err := writeLine(os.Stdout, line); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		if fs.NArg() > 1 {
-			return fmt.Errorf("list accepts at most one selection")
-		}
 
-		profile, err := opened.ResolveSelection(fs.Arg(0))
+		entries, err := buildListInventory(opened)
 		if err != nil {
 			return err
 		}
-		defer opened.WipeProfile(profile)
-
-		keys := profile.Keys()
-		for _, key := range keys {
-			if err := writeLine(os.Stdout, key); err != nil {
+		if jsonOutput {
+			payload, err := renderListInventoryJSON(entries)
+			if err != nil {
+				return err
+			}
+			return writeText(os.Stdout, string(payload))
+		}
+		for _, entry := range entries {
+			if err := writeLine(os.Stdout, formatListEntityLine(entry)); err != nil {
 				return err
 			}
 		}
@@ -852,6 +857,46 @@ func runShow(args []string) error {
 		}
 
 		return printResolvedShow(opened, target)
+	})
+}
+
+func runCreate(args []string) error {
+	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dir := fs.String("dir", defaultVaultDir(), "vault directory")
+	unlock := addUnlockFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := unlock.Validate(); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return fmt.Errorf("usage: env-vault create [shared flags] app|group NAME")
+	}
+
+	var kind vault.EntityKind
+	switch fs.Arg(0) {
+	case string(vault.EntityKindApp):
+		kind = vault.EntityKindApp
+	case string(vault.EntityKindGroup):
+		kind = vault.EntityKindGroup
+	default:
+		return fmt.Errorf("entity kind must be app or group, got %q", fs.Arg(0))
+	}
+	name := fs.Arg(1)
+	if err := vault.ValidateEntityName(name); err != nil {
+		return err
+	}
+
+	return withOpenedStore(*dir, *unlock, newUnlockAuditEvent("create", name), func(opened *vault.Opened) error {
+		if err := opened.CreateName(kind, name); err != nil {
+			return err
+		}
+		if err := opened.Save(); err != nil {
+			return err
+		}
+		return writeTextf(os.Stdout, "Created %s %s\n", kind, name)
 	})
 }
 
@@ -2117,15 +2162,22 @@ func (e *environ) Set(key, value string) {
 }
 
 func (e *environ) Unset(key string) {
-	prefix := strings.ToUpper(key) + "="
 	filtered := (*e)[:0]
 	for _, entry := range *e {
-		if strings.HasPrefix(strings.ToUpper(entry), prefix) {
+		entryKey, _, ok := strings.Cut(entry, "=")
+		if ok && environmentKeysEqual(runtime.GOOS, entryKey, key) {
 			continue
 		}
 		filtered = append(filtered, entry)
 	}
 	*e = filtered
+}
+
+func environmentKeysEqual(goos, left, right string) bool {
+	if goos == goosWindows {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 func addUnlockFlags(fs *flag.FlagSet) *unlockOptions {
@@ -2490,7 +2542,6 @@ func intFileDescriptor(file *os.File) (int, error) {
 	if fd > uintptr(maxInt) {
 		return 0, fmt.Errorf("file descriptor out of range")
 	}
-	//nolint:gosec // range check above guarantees the conversion is safe on this platform.
 	return int(fd), nil
 }
 

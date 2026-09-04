@@ -9,6 +9,7 @@ import (
 )
 
 func lockFile(path string) (func(), error) {
+	// #nosec G304 -- lock paths are derived from the configured vault directory and fixed blob names.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
