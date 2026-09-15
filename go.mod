@@ -33,7 +33,7 @@ require (
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/xo/terminfo v1.0.0 // indirect
+	github.com/xo/terminfo v1.2.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 )
