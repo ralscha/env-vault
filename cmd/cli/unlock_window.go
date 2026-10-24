@@ -168,6 +168,10 @@ func runUnlockHelper(args []string) error {
 	if *token == "" {
 		return fmt.Errorf("--token is required")
 	}
+	decodedToken, err := hex.DecodeString(*token)
+	if err != nil || len(decodedToken) != 16 {
+		return fmt.Errorf("--token must contain exactly 32 hexadecimal characters")
+	}
 
 	identityBytes, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -256,57 +260,55 @@ func serveUnlockWindowConn(conn net.Conn, state *unlockWindowState) bool {
 		_ = encoder.Encode(unlockResponse{Error: fmt.Sprintf("decode request: %v", err)})
 		return false
 	}
+	response, shutdown := handleUnlockRequest(request, state)
+	defer vault.Wipe(response.Identity)
+	_ = encoder.Encode(response)
+	return shutdown
+}
+
+func handleUnlockRequest(request unlockRequest, state *unlockWindowState) (unlockResponse, bool) {
 	if request.Token != state.lease.Token {
-		_ = encoder.Encode(unlockResponse{Error: "unauthorized"})
-		return false
+		return unlockResponse{Error: "unauthorized"}, false
+	}
+	// Closing the listener at expiry does not close an already accepted connection.
+	if !time.Now().Before(state.lease.ExpiresAt) {
+		return unlockResponse{Error: "unlock window has expired"}, true
 	}
 
 	switch request.Action {
 	case unlockActionIdentity:
-		identity := vault.MarshalIdentity(state.identity)
-		_ = encoder.Encode(unlockResponse{Identity: identity, ExpiresAt: state.lease.ExpiresAt})
-		vault.Wipe(identity)
-		return false
+		return unlockResponse{Identity: vault.MarshalIdentity(state.identity), ExpiresAt: state.lease.ExpiresAt}, false
 	case unlockActionStatus:
-		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)})
-		return false
+		return unlockResponse{ExpiresAt: state.lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)}, false
 	case unlockActionAudit:
 		if request.Event == nil || request.Event.Command == "" {
-			_ = encoder.Encode(unlockResponse{Error: "missing audit event"})
-			return false
+			return unlockResponse{Error: "missing audit event"}, false
 		}
 		state.auditEvents = appendUnlockAuditEvent(state.auditEvents, *request.Event)
-		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)})
-		return false
+		return unlockResponse{ExpiresAt: state.lease.ExpiresAt, Events: cloneUnlockAuditEvents(state.auditEvents)}, false
 	case unlockActionExtend:
 		if request.ExtendBy <= 0 {
-			_ = encoder.Encode(unlockResponse{Error: "extension duration must be greater than zero"})
-			return false
+			return unlockResponse{Error: "extension duration must be greater than zero"}, false
 		}
 		extendedExpiry := time.Now().UTC().Add(request.ExtendBy)
 		if extendedExpiry.After(state.lease.ExpiresAt) {
 			if !state.expiryTimer.Stop() {
-				_ = encoder.Encode(unlockResponse{Error: "unlock window has expired"})
-				return false
+				return unlockResponse{Error: "unlock window has expired"}, false
 			}
 			previousExpiry := state.lease.ExpiresAt
 			state.lease.ExpiresAt = extendedExpiry
 			if err := writeUnlockLease(state.leasePath, *state.lease); err != nil {
 				state.lease.ExpiresAt = previousExpiry
 				state.expiryTimer.Reset(max(time.Until(previousExpiry), time.Nanosecond))
-				_ = encoder.Encode(unlockResponse{Error: fmt.Sprintf("persist extension: %v", err)})
-				return false
+				return unlockResponse{Error: fmt.Sprintf("persist extension: %v", err)}, false
 			}
 			state.expiryTimer.Reset(time.Until(extendedExpiry))
 		}
-		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt})
-		return false
+		return unlockResponse{ExpiresAt: state.lease.ExpiresAt}, false
 	case unlockActionShutdown:
-		_ = encoder.Encode(unlockResponse{ExpiresAt: state.lease.ExpiresAt})
-		return true
+		return unlockResponse{ExpiresAt: state.lease.ExpiresAt}, true
 	default:
-		_ = encoder.Encode(unlockResponse{Error: fmt.Sprintf("unsupported action %q", request.Action)})
-		return false
+		return unlockResponse{Error: fmt.Sprintf("unsupported action %q", request.Action)}, false
 	}
 }
 
@@ -532,6 +534,10 @@ func startUnlockHelper(dir string, ttl time.Duration, identity *age.HybridIdenti
 	if err != nil {
 		return err
 	}
+	leasePath, err := unlockLeasePath(dir)
+	if err != nil {
+		return err
+	}
 	identityBytes := vault.MarshalIdentity(identity)
 	defer vault.Wipe(identityBytes)
 
@@ -541,31 +547,32 @@ func startUnlockHelper(dir string, ttl time.Duration, identity *age.HybridIdenti
 	if err != nil {
 		return err
 	}
-	cmd.Stdout = io.Discard
+	defer func() { _ = stdin.Close() }()
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	ready := false
+	defer func() {
+		if !ready {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			_ = removeUnlockLease(leasePath, token)
+		}
+	}()
 	if _, err := stdin.Write(identityBytes); err != nil {
-		_ = stdin.Close()
 		return err
 	}
 	if err := stdin.Close(); err != nil {
-		return err
-	}
-	if err := cmd.Process.Release(); err != nil {
-		return err
-	}
-
-	leasePath, err := unlockLeasePath(dir)
-	if err != nil {
 		return err
 	}
 	deadline := time.Now().Add(unlockHelperStartupDelay)
 	for time.Now().Before(deadline) {
 		lease, err := readUnlockLease(leasePath)
 		if err == nil && lease.Token == token {
-			if _, err := requestUnlockHelper(lease, unlockActionStatus, nil); err == nil {
+			if response, err := requestUnlockHelper(lease, unlockActionStatus, nil); err == nil && response.Error == "" {
+				ready = true
+				go func() { _ = cmd.Wait() }()
 				return nil
 			}
 		}
@@ -579,14 +586,14 @@ func currentExecutablePath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve current executable: %w", err)
 	}
-	path, err = filepath.EvalSymlinks(path)
+	resolvedPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("resolve current executable symlinks: %w", err)
 		}
 		return path, nil
 	}
-	return path, nil
+	return resolvedPath, nil
 }
 
 func requestUnlockHelper(lease unlockLease, action string, event *unlockAuditEvent) (unlockResponse, error) {

@@ -79,7 +79,12 @@ func decryptWithIdentity(ciphertext []byte, identity age.Identity) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	return io.ReadAll(r)
+	plaintext, err := io.ReadAll(r)
+	if err != nil {
+		Wipe(plaintext)
+		return nil, err
+	}
+	return plaintext, nil
 }
 
 func redactRecipient(recipient string) string {

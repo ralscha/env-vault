@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"env-vault/internal/secretio"
 	"env-vault/internal/vault"
 
 	"github.com/awnumar/memguard"
@@ -75,6 +76,10 @@ type unlockAuditEvent struct {
 
 type environ []string
 
+type childExitError struct {
+	*exec.ExitError
+}
+
 func main() {
 	memguard.CatchInterrupt()
 	os.Exit(runMain(os.Args[1:]))
@@ -84,6 +89,12 @@ func runMain(args []string) int {
 	defer memguard.Purge()
 
 	if err := run(args); err != nil {
+		if exitErr, ok := errors.AsType[*childExitError](err); ok {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				return 128 + int(status.Signal())
+			}
+			return exitErr.ExitCode()
+		}
 		if writeErr := writeLine(os.Stderr, "Error:", err); writeErr != nil {
 			return 1
 		}
@@ -159,7 +170,7 @@ func run(args []string) error {
 func printUsage(w io.Writer) error {
 	return writeText(w, `env-vault stores named sets of environment variables in a local encrypted vault.
 
-usage: env-vault [shared flags] <command> [<args> ...]
+usage: env-vault <command> [shared flags] [<args> ...]
 
 Minimal local secret vault for grouped application environment variables.
 
@@ -561,7 +572,7 @@ func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	dir := fs.String("dir", defaultVaultDir(), "vault directory")
-	workFactor := fs.Int("work-factor", defaultScryptWorkFactor, "age scrypt work factor")
+	workFactor := fs.Int("work-factor", defaultScryptWorkFactor, "age scrypt work factor (14-22)")
 	unlock := addUnlockFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -962,6 +973,7 @@ func buildListJSONEntry(opened *vault.Opened, name string) (listJSONEntry, error
 			return listJSONEntry{}, err
 		}
 		entry.LinkedGroupCount = len(app.Groups)
+		app.Wipe()
 	}
 	return entry, nil
 }
@@ -1172,6 +1184,7 @@ func runExport(args []string) error {
 		if err != nil {
 			return err
 		}
+		defer vault.Wipe(content)
 
 		stdoutIsTerminal, err := isTerminalFile(os.Stdout)
 		if err != nil {
@@ -1428,12 +1441,7 @@ func runShell(args []string) error {
 
 func buildExecEnv(profileName string, profile vault.Profile) []string {
 	env := environ(os.Environ())
-	keys := make([]string, 0, len(profile))
-	for key := range profile {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
+	for _, key := range profile.Keys() {
 		env.Set(key, string(profile[key]))
 	}
 	env.Set(envVaultActiveVar, "1")
@@ -1498,7 +1506,11 @@ func quotePOSIXShell(value string) string {
 func extractBoolFlag(args []string, flagName string) ([]string, bool) {
 	filtered := make([]string, 0, len(args))
 	found := false
-	for _, arg := range args {
+	for index, arg := range args {
+		if arg == "--" {
+			filtered = append(filtered, args[index:]...)
+			break
+		}
 		if arg == flagName {
 			found = true
 			continue
@@ -1513,6 +1525,10 @@ func extractStringFlag(args []string, flagName string) ([]string, string, error)
 	value := ""
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
+		if arg == "--" {
+			filtered = append(filtered, args[index:]...)
+			break
+		}
 		if after, ok := strings.CutPrefix(arg, flagName+"="); ok {
 			value = strings.TrimSpace(after)
 			if value == "" {
@@ -1639,6 +1655,7 @@ func printEntityShow(opened *vault.Opened, name string) error {
 		if err != nil {
 			return err
 		}
+		defer app.Wipe()
 		if err := writeTextf(os.Stdout, "linked groups: %d\n", len(app.Groups)); err != nil {
 			return err
 		}
@@ -1755,6 +1772,7 @@ func renderEntityShowJSON(opened *vault.Opened, name string) ([]byte, error) {
 			return nil, err
 		}
 		payload.LinkedGroups = append([]string(nil), app.Groups...)
+		app.Wipe()
 	}
 	return marshalJSONLine(payload)
 }
@@ -1955,12 +1973,12 @@ func metadataTimeValue(value time.Time) string {
 }
 
 func editEntityInEditor(name string, kind vault.EntityKind, directKeys map[string]string, editorOverride string) (editableMetadata, bool, error) {
-	original := editableMetadata{
-		Keys: cloneStringMap(directKeys)}
+	original := editableMetadata{Keys: maps.Clone(directKeys)}
 	contents, err := renderEditableEntity(original)
 	if err != nil {
 		return editableMetadata{}, false, err
 	}
+	defer vault.Wipe(contents)
 	path, err := writeTempMetadataFile(contents)
 	if err != nil {
 		return editableMetadata{}, false, err
@@ -1984,6 +2002,7 @@ func editEntityInEditor(name string, kind vault.EntityKind, directKeys map[strin
 	if err != nil {
 		return editableMetadata{}, false, err
 	}
+	defer vault.Wipe(updatedContents)
 	updated, err := parseEditableEntity(updatedContents)
 	if err != nil {
 		return editableMetadata{}, false, err
@@ -2019,6 +2038,7 @@ func applyEditedEntity(opened *vault.Opened, name string, kind vault.EntityKind,
 		default:
 			err = fmt.Errorf("internal error: unsupported entity kind %q", kind)
 		}
+		vault.Wipe(data)
 		if err != nil {
 			return err
 		}
@@ -2031,16 +2051,24 @@ func renderEditableEntity(entity editableMetadata) ([]byte, error) {
 }
 
 func parseEditableEntity(data []byte) (editableMetadata, error) {
-	var metadata editableMetadata
-	if err := json.Unmarshal(data, &metadata); err != nil {
+	var metadata *editableMetadata
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&metadata); err != nil {
 		return editableMetadata{}, fmt.Errorf("parse edited metadata: %w", err)
+	}
+	if metadata == nil {
+		return editableMetadata{}, fmt.Errorf("edited metadata must be a JSON object")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return editableMetadata{}, fmt.Errorf("edited metadata must contain exactly one JSON object")
 	}
 	keys, err := normalizeEditableKeys(metadata.Keys)
 	if err != nil {
 		return editableMetadata{}, err
 	}
 	metadata.Keys = keys
-	return metadata, nil
+	return *metadata, nil
 }
 
 func normalizeEditableKeys(keys map[string]string) (map[string]string, error) {
@@ -2052,6 +2080,9 @@ func normalizeEditableKeys(keys map[string]string) (map[string]string, error) {
 		key = strings.TrimSpace(key)
 		if err := vault.ValidateEnvKey(key); err != nil {
 			return nil, err
+		}
+		if _, exists := normalized[key]; exists {
+			return nil, fmt.Errorf("duplicate edited key after trimming whitespace: %s", key)
 		}
 		normalized[key] = value
 	}
@@ -2085,15 +2116,6 @@ func directKeyValues(opened *vault.Opened, name string, kind vault.EntityKind) (
 		return nil, vault.ErrNameNotFound
 	}
 	return values, nil
-}
-
-func cloneStringMap(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return map[string]string{}
-	}
-	clone := make(map[string]string, len(src))
-	maps.Copy(clone, src)
-	return clone
 }
 
 func writeTempMetadataFile(contents []byte) (string, error) {
@@ -2301,13 +2323,11 @@ func readNonInteractiveMasterPassword(unlock unlockOptions) ([]byte, error) {
 	case unlock.passwordFile != "":
 		return readSecretFromFile(unlock.passwordFile)
 	case unlock.passwordFDSet:
-		file, err := openFileDescriptor(unlock.passwordFD)
+		file, err := secretio.DuplicateFD(unlock.passwordFD)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("open --password-fd: %w", err)
 		}
-		if file == nil {
-			return nil, fmt.Errorf("open --password-fd %d", unlock.passwordFD)
-		}
+		defer func() { _ = file.Close() }()
 		return readSecretFromReader(file, fmt.Sprintf("master password from fd %d", unlock.passwordFD))
 	default:
 		return nil, fmt.Errorf("internal error: no non-interactive unlock source selected")
@@ -2367,6 +2387,7 @@ func entityDetails(opened *vault.Opened, name string) (int, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	defer app.Wipe()
 	return len(keys), len(app.Groups), nil
 }
 
@@ -2490,6 +2511,7 @@ func promptSecretBuffer(prompt, nonInteractiveHint string) (*memguard.LockedBuff
 		return nil, err
 	}
 	secret, err := readPasswordFromFile(os.Stdin)
+	defer memguard.WipeBytes(secret)
 	if writeErr := writeLine(os.Stderr); writeErr != nil && err == nil {
 		err = writeErr
 	}
@@ -2497,25 +2519,16 @@ func promptSecretBuffer(prompt, nonInteractiveHint string) (*memguard.LockedBuff
 		return nil, err
 	}
 	if len(secret) == 0 {
-		memguard.WipeBytes(secret)
 		return nil, fmt.Errorf("empty input is not allowed")
 	}
 	locked := memguard.NewBufferFromBytes(secret)
-	memguard.WipeBytes(secret)
 	return locked, nil
 }
 
 func runChildProcess(cmd *exec.Cmd) error {
 	err := cmd.Run()
-	if err == nil {
-		return nil
-	}
-
 	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-			os.Exit(status.ExitStatus())
-		}
-		os.Exit(exitErr.ExitCode())
+		return &childExitError{exitErr}
 	}
 	return err
 }
@@ -2543,13 +2556,6 @@ func intFileDescriptor(file *os.File) (int, error) {
 		return 0, fmt.Errorf("file descriptor out of range")
 	}
 	return int(fd), nil
-}
-
-func openFileDescriptor(fd int) (*os.File, error) {
-	if fd < 0 {
-		return nil, fmt.Errorf("open --password-fd %d", fd)
-	}
-	return os.NewFile(uintptr(fd), fmt.Sprintf("fd-%d", fd)), nil
 }
 
 func cloneBytes(src []byte) []byte {

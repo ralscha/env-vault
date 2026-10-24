@@ -7,9 +7,9 @@ import (
 
 	"env-vault/internal/vault"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type formKind string
@@ -41,6 +41,7 @@ type formState struct {
 	focus          int
 	selectedOption int
 	choice         vault.EntityKind
+	target         string
 }
 
 type Model struct {
@@ -99,7 +100,7 @@ func NewModel(opened *vault.Opened, dir string) (Model, error) {
 	search.Placeholder = "Search names, kinds, keys, groups"
 	search.Prompt = "/ "
 	search.CharLimit = 120
-	search.Width = 32
+	search.SetWidth(32)
 
 	m := Model{
 		opened:   opened,
@@ -163,9 +164,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = typed.Width
 		m.height = typed.Height
-		m.search.Width = max(12, typed.Width-10)
+		m.search.SetWidth(max(12, typed.Width-10))
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
+		if typed.String() == "ctrl+c" {
+			m.quitting = true
+			return m, tea.Quit
+		}
 		if m.form != nil {
 			return m.updateForm(typed)
 		}
@@ -173,11 +178,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(typed)
 		}
 		if m.search.Focused() {
-			switch typed.String() {
-			case "ctrl+c":
-				m.quitting = true
-				return m, tea.Quit
-			case keyEscape:
+			if typed.String() == keyEscape {
 				m.search.Blur()
 				return m, nil
 			}
@@ -186,7 +187,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 		switch typed.String() {
-		case "ctrl+c", "q":
+		case "q":
 			m.quitting = true
 			return m, tea.Quit
 		case "up", "k":
@@ -196,29 +197,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.moveSelection(1)
 			return m, nil
 		case "/":
-			m.search.Focus()
-			return m, nil
+			cmd = m.search.Focus()
+			return m, cmd
 		case keyEscape:
 			m.search.Blur()
 			return m, nil
 		case "n":
 			m.form = newCreateForm()
-			return m, nil
+			return m, textinput.Blink
 		case "r":
 			if m.hasSelection() {
 				m.form = newSingleValueForm(formRename, "Rename entity", "New name", m.selectedName)
 			}
-			return m, nil
+			return m, textinput.Blink
 		case "y":
 			if m.hasSelection() {
 				m.form = newSingleValueForm(formCopy, "Copy entity", "Destination name", m.selectedName+"-copy")
 			}
-			return m, nil
+			return m, textinput.Blink
 		case "a":
 			if m.hasSelection() {
 				m.form = newKeyValueForm("Set direct key")
 			}
-			return m, nil
+			return m, textinput.Blink
 		case "d":
 			if m.hasSelection() {
 				keys := directKeys(m.details.Direct)
@@ -228,7 +229,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.form = newOptionForm(formUnset, "Unset direct key", "Choose a direct key to remove.", keys)
 			}
-			return m, nil
+			return m, textinput.Blink
 		case "l":
 			if m.hasSelection() && m.details.Summary.Kind == vault.EntityKindApp {
 				groups := availableLinkGroups(m.items, m.details.LinkedGroups)
@@ -238,7 +239,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.form = newOptionForm(formLink, "Link group to app", "Choose a group to add to the app.", groups)
 			}
-			return m, nil
+			return m, textinput.Blink
 		case "u":
 			if m.hasSelection() && m.details.Summary.Kind == vault.EntityKindApp {
 				if len(m.details.LinkedGroups) == 0 {
@@ -247,7 +248,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.form = newOptionForm(formUnlink, "Unlink group from app", "Choose a linked group to remove from the app.", append([]string(nil), m.details.LinkedGroups...))
 			}
-			return m, nil
+			return m, textinput.Blink
 		case "x":
 			if m.hasSelection() {
 				m.confirming = true
@@ -258,7 +259,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "ctrl+r":
 			m.status = ""
-			_ = m.reloadSelection(m.selectedName)
+			if err := m.opened.Reload(); err != nil {
+				m.status = err.Error()
+				return m, nil
+			}
+			if err := m.reloadSelection(m.selectedName); err != nil {
+				m.status = err.Error()
+			}
 			return m, nil
 		}
 		m.search, cmd = m.search.Update(msg)
@@ -266,19 +273,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	if m.form != nil {
+		return m.updateFormInput(msg)
+	}
 	m.search, cmd = m.search.Update(msg)
 	m.applyFilter()
 	return m, cmd
 }
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
+	view := tea.NewView(m.renderView())
+	view.AltScreen = true
+	return view
+}
+
+func (m Model) renderView() string {
 	if m.width == 0 || m.height == 0 {
 		return "Loading..."
 	}
 
 	header := m.renderHeader()
-	body := m.renderBody()
 	footer := m.renderFooter()
+	body := m.renderBody(max(3, m.height-lipgloss.Height(header)-lipgloss.Height(footer)))
 	content := lipgloss.JoinVertical(lipgloss.Left, header, body, footer)
 
 	if m.form != nil {
@@ -290,7 +306,7 @@ func (m Model) View() string {
 	return content
 }
 
-func (m *Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) updateForm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	form := m.form
 	if form == nil {
 		return m, nil
@@ -300,7 +316,7 @@ func (m *Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case keyEscape:
 		m.form = nil
 		return m, nil
-	case "j", "down":
+	case "down":
 		if len(form.options) > 0 {
 			filtered := filteredFormOptions(form)
 			if len(filtered) == 0 {
@@ -309,7 +325,7 @@ func (m *Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			form.selectedOption = (form.selectedOption + 1) % len(filtered)
 			return m, nil
 		}
-	case "k", "up":
+	case "up":
 		if len(form.options) > 0 {
 			filtered := filteredFormOptions(form)
 			if len(filtered) == 0 {
@@ -336,44 +352,41 @@ func (m *Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			delta = -1
 		}
 		form.focus = (form.focus + delta + len(form.fields)) % len(form.fields)
+		var cmd tea.Cmd
 		for index := range form.fields {
 			if index == form.focus {
-				form.fields[index].input.Focus()
+				cmd = form.fields[index].input.Focus()
 			} else {
 				form.fields[index].input.Blur()
 			}
 		}
-		return m, nil
-	case "left", "right":
+		return m, cmd
+	case "ctrl+left", "ctrl+right":
 		if form.kind == formCreate {
 			if form.choice == vault.EntityKindApp {
 				form.choice = vault.EntityKindGroup
 			} else {
 				form.choice = vault.EntityKindApp
 			}
+			return m, nil
 		}
-		return m, nil
-	case "ctrl+s":
-		if len(form.options) > 0 {
+	case "ctrl+s", "enter":
+		if msg.String() == "ctrl+s" && len(form.options) > 0 {
 			return m, nil
 		}
 		if err := m.submitForm(); err != nil {
 			m.status = err.Error()
-			m.form = nil
-			return m, nil
-		}
-		m.form = nil
-		return m, nil
-	case "enter":
-		if err := m.submitForm(); err != nil {
-			m.status = err.Error()
-			m.form = nil
 			return m, nil
 		}
 		m.form = nil
 		return m, nil
 	}
 
+	return m.updateFormInput(msg)
+}
+
+func (m *Model) updateFormInput(msg tea.Msg) (tea.Model, tea.Cmd) {
+	form := m.form
 	if len(form.options) > 0 {
 		updated, cmd := form.optionFilter.Update(msg)
 		form.optionFilter = updated
@@ -387,7 +400,7 @@ func (m *Model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m *Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) updateConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case keyEscape, "n":
 		m.confirming = false
@@ -399,7 +412,7 @@ func (m *Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirming = false
 			return m, nil
 		}
-		if err := m.opened.Save(); err != nil {
+		if err := m.saveChanges(); err != nil {
 			m.status = err.Error()
 			m.confirming = false
 			return m, nil
@@ -433,6 +446,12 @@ func (m *Model) submitForm() error {
 	}
 
 	selected := m.selectedName
+	if m.form.kind != formCreate {
+		if m.form.target == "" {
+			m.form.target = selected
+		}
+		selected = m.form.target
+	}
 	var status string
 	switch m.form.kind {
 	case formCreate:
@@ -468,7 +487,7 @@ func (m *Model) submitForm() error {
 		if values[0] == "" {
 			return fmt.Errorf("key is required")
 		}
-		switch m.details.Summary.Kind {
+		switch m.opened.Kind(selected) {
 		case vault.EntityKindUnknown:
 			return fmt.Errorf("no entity selected")
 		case vault.EntityKindApp:
@@ -480,7 +499,7 @@ func (m *Model) submitForm() error {
 				return err
 			}
 		default:
-			return fmt.Errorf("unsupported entity kind %q", m.details.Summary.Kind)
+			return fmt.Errorf("unsupported entity kind %q", m.opened.Kind(selected))
 		}
 		status = fmt.Sprintf("Stored %s in %s", values[0], selected)
 	case formUnset:
@@ -511,13 +530,27 @@ func (m *Model) submitForm() error {
 		return fmt.Errorf("unsupported form %q", m.form.kind)
 	}
 
-	if err := m.opened.Save(); err != nil {
+	if err := m.saveChanges(); err != nil {
 		return err
 	}
 	if err := m.reloadSelection(selected); err != nil {
 		return err
 	}
 	m.status = status
+	return nil
+}
+
+func (m *Model) saveChanges() error {
+	if err := m.opened.Save(); err != nil {
+		// Discard the failed edit so retries and subsequent edits start from disk.
+		if reloadErr := m.opened.Reload(); reloadErr != nil {
+			return fmt.Errorf("%w; reload failed: %w", err, reloadErr)
+		}
+		if reloadErr := m.reloadSelection(m.selectedName); reloadErr != nil {
+			return fmt.Errorf("%w; refresh failed: %w", err, reloadErr)
+		}
+		return err
+	}
 	return nil
 }
 
@@ -552,7 +585,9 @@ func (m *Model) applyFilter() {
 	}
 	m.selected = 0
 	m.selectedName = m.filtered[0].Name
-	_ = m.syncDetails()
+	if err := m.syncDetails(); err != nil {
+		m.status = err.Error()
+	}
 }
 
 func (m *Model) selectByName(name string) {
@@ -587,6 +622,7 @@ func (m *Model) syncDetails() error {
 	}
 	details, err := LoadDetails(m.opened, m.selectedName)
 	if err != nil {
+		m.details = EntityDetails{}
 		return err
 	}
 	m.details = details
@@ -609,17 +645,13 @@ func (m Model) renderHeader() string {
 	return lipgloss.NewStyle().Width(m.width).Padding(0, 1).Render(strings.Join(lines, "\n"))
 }
 
-func (m Model) renderBody() string {
-	headerHeight := 3
-	if m.height >= 22 {
-		headerHeight = 4
-	}
-	footerHeight := m.footerLineCount(max(12, m.width-4))
-	bodyHeight := max(9, m.height-headerHeight-footerHeight-1)
-	leftWidth := max(26, min(40, m.width/3))
-	rightWidth := max(40, m.width-leftWidth-3)
-	left := m.styles.border.Width(leftWidth).Height(bodyHeight).Render(m.renderList(leftWidth - 4))
-	right := m.styles.selectionBorder.Width(rightWidth).Height(bodyHeight).Render(m.renderDetails(bodyHeight - 2))
+func (m Model) renderBody(bodyHeight int) string {
+	leftWidth := max(12, min(40, m.width/3))
+	rightWidth := max(12, m.width-leftWidth-3)
+	left := m.styles.border.Width(leftWidth).Height(bodyHeight).MaxHeight(bodyHeight).
+		Render(m.renderList(leftWidth-4, bodyHeight-2))
+	right := m.styles.selectionBorder.Width(rightWidth).Height(bodyHeight).MaxHeight(bodyHeight).
+		Render(m.renderDetails(bodyHeight - 2))
 	return lipgloss.NewStyle().Padding(0, 1).Render(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right))
 }
 
@@ -634,14 +666,20 @@ func (m Model) renderFooter() string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderList(width int) string {
+func (m Model) renderList(width, height int) string {
 	lines := []string{m.styles.section.Render("Entities")}
 	if len(m.filtered) == 0 {
 		lines = append(lines, m.styles.muted.Render("No matching apps or groups."))
 		return strings.Join(lines, "\n")
 	}
 	compact := m.height > 0 && m.height < 22
-	for index, item := range m.filtered {
+	rowHeight := 2
+	if compact {
+		rowHeight = 1
+	}
+	start, end := optionWindow(len(m.filtered), m.selected, max(1, (height-1)/rowHeight))
+	for index := start; index < end; index++ {
+		item := m.filtered[index]
 		badge := m.styles.groupBadge.Render("GROUP")
 		meta := fmt.Sprintf("%d keys", item.DirectKeyCount)
 		if item.Kind == vault.EntityKindApp {
@@ -661,10 +699,10 @@ func (m Model) renderList(width int) string {
 			}
 		}
 		if index == m.selected {
-			lines = append(lines, m.styles.selectedItem.Width(width).Render(line))
+			lines = append(lines, m.styles.selectedItem.Width(width).MaxWidth(width).MaxHeight(rowHeight).Render(line))
 			continue
 		}
-		lines = append(lines, m.styles.item.Width(width).Render(line))
+		lines = append(lines, m.styles.item.Width(width).MaxWidth(width).MaxHeight(rowHeight).Render(line))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -804,7 +842,7 @@ func renderKindChoice(kind vault.EntityKind, styles styles) string {
 	}
 
 	control := lipgloss.JoinHorizontal(lipgloss.Top, app, divider, group)
-	help := styles.muted.Render("Left/Right switches the selection")
+	help := styles.muted.Render("Ctrl+Left/Right switches the selection")
 	return lipgloss.JoinVertical(lipgloss.Left, container.Render(control), help)
 }
 
@@ -843,7 +881,6 @@ func (m Model) renderModalHelp() string {
 		return strings.Join([]string{
 			shortAction("Type", "filter"),
 			shortAction("↑↓", "choose"),
-			shortAction("J/K", "move"),
 			shortAction("Enter", "confirm"),
 			shortAction("Esc", "cancel"),
 		}, "   ")
@@ -857,7 +894,7 @@ func (m Model) renderModalHelp() string {
 		shortAction("Esc", "cancel"),
 	}
 	if m.form != nil && m.form.kind == formCreate {
-		parts = append(parts, shortAction("Left/Right", "switch kind"))
+		parts = append(parts, shortAction("Ctrl+Left/Right", "switch kind"))
 	}
 	return strings.Join(parts, "   ")
 }
@@ -873,7 +910,6 @@ func (m Model) contextActions() []actionItem {
 			return []actionItem{
 				{key: "Type", label: "filter"},
 				{key: "↑↓", label: "choose"},
-				{key: "J/K", label: "move"},
 				{key: "Enter", label: "confirm"},
 				{key: "Esc", label: "cancel"},
 			}
@@ -937,17 +973,6 @@ func toggleLabel(reveal bool) string {
 
 func shortAction(key, label string) string {
 	return key + " " + label
-}
-
-func (m Model) footerLineCount(width int) int {
-	count := len(m.actionBarLines(width))
-	if count == 0 {
-		count = 1
-	}
-	if m.status != "" {
-		count++
-	}
-	return count
 }
 
 func renderKeyValues(values []KeyValue, reveal bool, styles styles) string {
@@ -1095,6 +1120,9 @@ func formatTimestampLine(createdAt, modifiedAt time.Time) string {
 }
 
 func truncateLines(content string, maxLines int) string {
+	if maxLines <= 0 {
+		return ""
+	}
 	lines := strings.Split(content, "\n")
 	if len(lines) <= maxLines {
 		return content
@@ -1115,7 +1143,12 @@ func maskValue(value string) string {
 }
 
 func placeOverlay(background, overlay string) string {
-	return lipgloss.Place(lipgloss.Width(background), lipgloss.Height(background), lipgloss.Center, lipgloss.Center, background+"\n"+overlay)
+	x := max(0, (lipgloss.Width(background)-lipgloss.Width(overlay))/2)
+	y := max(0, (lipgloss.Height(background)-lipgloss.Height(overlay))/2)
+	return lipgloss.NewCompositor(
+		lipgloss.NewLayer(background),
+		lipgloss.NewLayer(overlay).X(x).Y(y),
+	).Render()
 }
 
 func (m Model) hasSelection() bool {

@@ -60,19 +60,24 @@ func (s *Store) Dir() string {
 }
 
 func (s *Store) Init(password []byte, workFactor int) (string, error) {
-	if workFactor < 14 || workFactor > 30 {
-		return "", fmt.Errorf("work factor must be between 14 and 30")
+	// age's default ScryptIdentity accepts factors up to 22. Higher values
+	// would create an identity file that this store cannot subsequently open.
+	if workFactor < 14 || workFactor > 22 {
+		return "", fmt.Errorf("work factor must be between 14 and 22")
 	}
 	ctx := context.Background()
 	if err := s.backend.Init(ctx); err != nil {
 		return "", err
 	}
-	initialized, err := s.isInitialized(ctx)
-	if err != nil {
-		return "", err
-	}
-	if initialized {
-		return "", ErrAlreadyInitialized
+	// A partial initialization still contains data that must not be replaced.
+	for _, kind := range []BlobKind{BlobIdentity, BlobVault} {
+		exists, _, err := s.backend.Stat(ctx, kind)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			return "", ErrAlreadyInitialized
+		}
 	}
 
 	identity, plaintextIdentity, err := generateIdentityFile()
@@ -92,21 +97,13 @@ func (s *Store) Init(password []byte, workFactor int) (string, error) {
 	}
 
 	file := NewFile()
-	if _, err := s.saveFile(ctx, file, identity, ""); err != nil {
+	if _, err := s.saveFile(ctx, file, identity, SaveOptions{CreateOnly: true}); err != nil {
 		return "", err
 	}
 	return identity.Recipient().String(), nil
 }
 
 func (s *Store) Open(password []byte) (*Opened, error) {
-	initialized, err := s.isInitialized(context.Background())
-	if err != nil {
-		return nil, err
-	}
-	if !initialized {
-		return nil, ErrNotInitialized
-	}
-
 	identity, err := s.DecryptIdentity(password)
 	if err != nil {
 		return nil, err
@@ -148,6 +145,9 @@ func (s *Store) DecryptIdentity(password []byte) (*age.HybridIdentity, error) {
 }
 
 func (s *Store) OpenWithIdentity(identity *age.HybridIdentity) (*Opened, error) {
+	if identity == nil {
+		return nil, fmt.Errorf("identity cannot be nil")
+	}
 	initialized, err := s.isInitialized(context.Background())
 	if err != nil {
 		return nil, err
@@ -192,11 +192,27 @@ func (o *Opened) Save() error {
 	if err := o.file.Validate(); err != nil {
 		return err
 	}
-	version, err := o.store.saveFile(context.Background(), o.file, o.identity.identity, o.vaultVersion)
+	version, err := o.store.saveFile(context.Background(), o.file, o.identity.identity, SaveOptions{ExpectedVersion: o.vaultVersion})
 	if err != nil {
 		return err
 	}
 	o.vaultVersion = version
+	return nil
+}
+
+// Reload discards unsaved changes and loads the current vault. If loading
+// fails, the current contents remain available.
+func (o *Opened) Reload() error {
+	if o.identity == nil {
+		return fmt.Errorf("vault is closed")
+	}
+	current, err := o.store.openWithIdentityHandle(o.identity)
+	if err != nil {
+		return err
+	}
+	o.file.Wipe()
+	o.file = current.file
+	o.vaultVersion = current.vaultVersion
 	return nil
 }
 
@@ -208,13 +224,7 @@ func (o *Opened) SetGroup(groupName, key string, value []byte) error {
 		return err
 	}
 	now := time.Now().UTC()
-	switch o.file.Kind(groupName) {
-	case EntityKindUnknown:
-		if o.file.HasName(groupName) {
-			return fmt.Errorf("%w: %s", ErrNameInUse, groupName)
-		}
-	case EntityKindGroup:
-	case EntityKindApp:
+	if o.file.Kind(groupName) == EntityKindApp {
 		return fmt.Errorf("%w: %s is an app", ErrNameInUse, groupName)
 	}
 	profile := o.file.ensureGroup(groupName)
@@ -234,13 +244,7 @@ func (o *Opened) SetApp(appName, key string, value []byte) error {
 		return err
 	}
 	now := time.Now().UTC()
-	switch o.file.Kind(appName) {
-	case EntityKindUnknown:
-		if o.file.HasName(appName) {
-			return fmt.Errorf("%w: %s", ErrNameInUse, appName)
-		}
-	case EntityKindApp:
-	case EntityKindGroup:
+	if o.file.Kind(appName) == EntityKindGroup {
 		return fmt.Errorf("%w: %s is a group", ErrNameInUse, appName)
 	}
 	app := o.file.ensureApp(appName)
@@ -585,9 +589,6 @@ func ParseSelection(spec string) ([]string, error) {
 		}
 		names = append(names, name)
 	}
-	if len(names) == 0 {
-		return nil, fmt.Errorf("selection cannot be empty")
-	}
 	return names, nil
 }
 
@@ -614,7 +615,7 @@ func (o *Opened) Close() {
 	}
 }
 
-func (s *Store) saveFile(ctx context.Context, file *File, identity *age.HybridIdentity, expectedVersion string) (string, error) {
+func (s *Store) saveFile(ctx context.Context, file *File, identity *age.HybridIdentity, opts SaveOptions) (string, error) {
 	plaintext, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return "", err
@@ -627,7 +628,7 @@ func (s *Store) saveFile(ctx context.Context, file *File, identity *age.HybridId
 	}
 	defer Wipe(ciphertext)
 
-	return s.backend.Save(ctx, BlobVault, Blob{Data: ciphertext}, SaveOptions{ExpectedVersion: expectedVersion})
+	return s.backend.Save(ctx, BlobVault, Blob{Data: ciphertext}, opts)
 }
 
 func (s *Store) isInitialized(ctx context.Context) (bool, error) {
@@ -643,7 +644,5 @@ func (s *Store) isInitialized(ctx context.Context) (bool, error) {
 }
 
 func Wipe(buf []byte) {
-	for i := range buf {
-		buf[i] = 0
-	}
+	clear(buf)
 }

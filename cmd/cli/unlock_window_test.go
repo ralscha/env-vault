@@ -1,15 +1,93 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
-	"net"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"env-vault/internal/vault"
+
+	"filippo.io/age"
 )
+
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == unlockHelperCommand {
+		os.Exit(runMain(os.Args[1:]))
+	}
+	os.Exit(m.Run())
+}
+
+func TestUnlockHelperLifecycle(t *testing.T) {
+	cache := shortRuntimeDir(t)
+	t.Setenv("LOCALAPPDATA", cache)
+	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("HOME", cache)
+	dir := t.TempDir()
+	identity, err := age.GenerateHybridIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := startUnlockHelper(dir, time.Minute, identity); err != nil {
+		t.Fatalf("start helper: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = clearUnlockWindow(dir)
+		leasePath, err := unlockLeasePath(dir)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := readUnlockLease(leasePath); errors.Is(err, errNoUnlockWindow) {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Error("helper did not remove its lease after shutdown")
+	})
+	identityBytes, initialLease, err := fetchIdentityFromUnlockWindow(dir)
+	if err != nil {
+		t.Fatalf("fetch identity: %v", err)
+	}
+	defer vault.Wipe(identityBytes)
+	fetchedIdentity, err := vault.ParseIdentity(identityBytes)
+	if err != nil || fetchedIdentity.Recipient().String() != identity.Recipient().String() {
+		t.Fatal("helper did not return the expected identity")
+	}
+	if err := extendUnlockWindow(dir, 2*time.Minute); err != nil {
+		t.Fatalf("extend helper: %v", err)
+	}
+	status, err := unlockWindowStatus(dir)
+	if err != nil {
+		t.Fatalf("helper status: %v", err)
+	}
+	if !status.Lease.ExpiresAt.After(initialLease.ExpiresAt) {
+		t.Fatal("helper expiry was not extended")
+	}
+	if cleared, err := clearUnlockWindow(dir); err != nil || !cleared {
+		t.Fatalf("clear helper = %t, %v", cleared, err)
+	}
+}
+
+func shortRuntimeDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS != goosWindows {
+		// Unix sockets have a small pathname limit; macOS test directories are long.
+		dir, err := os.MkdirTemp("/tmp", "e")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		return dir
+	}
+	return t.TempDir()
+}
 
 func TestVaultDirFingerprintStable(t *testing.T) {
 	dir := filepath.Join("C:\\Temp", "Vault")
@@ -86,6 +164,32 @@ func TestRandomUnlockToken(t *testing.T) {
 	}
 }
 
+func TestUnlockHelperRejectsMalformedTokens(t *testing.T) {
+	for _, token := range []string{"", "short", strings.Repeat("z", 32), strings.Repeat("0", 34)} {
+		if err := runUnlockHelper([]string{"--ttl", "1m", "--token", token}); err == nil {
+			t.Fatalf("expected invalid token %q to fail before reading the identity", token)
+		}
+	}
+}
+
+func TestUnlockHelperRejectsExpiredRequests(t *testing.T) {
+	for _, action := range []string{unlockActionIdentity, unlockActionStatus, unlockActionExtend} {
+		t.Run(action, func(t *testing.T) {
+			state := &unlockWindowState{lease: &unlockLease{
+				Token:     "test-token",
+				ExpiresAt: time.Now().Add(-time.Second),
+			}}
+			response, shutdown := handleUnlockRequest(unlockRequest{Token: state.lease.Token, Action: action, ExtendBy: time.Minute}, state)
+			if response.Error != "unlock window has expired" || len(response.Identity) != 0 {
+				t.Fatalf("expired helper returned unexpected response: %#v", response)
+			}
+			if !shutdown {
+				t.Fatal("expired helper must shut down")
+			}
+		})
+	}
+}
+
 func TestAppendUnlockAuditEventKeepsNewestEntries(t *testing.T) {
 	events := []unlockAuditEvent{}
 	for index := range unlockAuditEventLimit + 3 {
@@ -122,26 +226,13 @@ func TestUnlockHelperExtendsActiveLease(t *testing.T) {
 	}
 	defer state.expiryTimer.Stop()
 
-	client, server := net.Pipe()
-	done := make(chan bool, 1)
-	go func() {
-		done <- serveUnlockWindowConn(server, state)
-	}()
-
 	request := unlockRequest{
 		Action:   unlockActionExtend,
 		Token:    lease.Token,
 		ExtendBy: 5 * time.Minute,
 	}
-	if err := json.NewEncoder(client).Encode(request); err != nil {
-		t.Fatalf("encode extension request: %v", err)
-	}
-	response := unlockResponse{}
-	if err := json.NewDecoder(client).Decode(&response); err != nil {
-		t.Fatalf("decode extension response: %v", err)
-	}
-	_ = client.Close()
-	if shutdown := <-done; shutdown {
+	response, shutdown := handleUnlockRequest(request, state)
+	if shutdown {
 		t.Fatal("extension unexpectedly shut down helper")
 	}
 	if response.Error != "" {
@@ -161,8 +252,12 @@ func TestUnlockHelperExtendsActiveLease(t *testing.T) {
 }
 
 func TestUnlockTransportRoundTrip(t *testing.T) {
-	runtimeDir := t.TempDir()
-	transport, listener, cleanup, err := listenUnlockTransport(runtimeDir, "abc123", "0123456789abcdef0123456789abcdef")
+	runtimeDir := shortRuntimeDir(t)
+	token, err := randomUnlockToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, listener, cleanup, err := listenUnlockTransport(runtimeDir, "test", token)
 	if err != nil {
 		t.Fatalf("listen unlock transport: %v", err)
 	}

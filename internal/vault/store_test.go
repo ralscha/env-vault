@@ -1,12 +1,153 @@
 package vault
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestInitPreservesPartialVault(t *testing.T) {
+	for _, kind := range []BlobKind{BlobIdentity, BlobVault} {
+		t.Run(string(kind), func(t *testing.T) {
+			backend := NewFileBackend(t.TempDir())
+			if _, err := backend.Save(context.Background(), kind, Blob{Data: []byte("existing")}, SaveOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			store := NewStoreWithBackend(backend)
+			if _, err := store.Init([]byte("password"), 14); !errors.Is(err, ErrAlreadyInitialized) {
+				t.Fatalf("Init returned %v, want ErrAlreadyInitialized", err)
+			}
+			for _, blobKind := range []BlobKind{BlobIdentity, BlobVault} {
+				blob, err := backend.Load(context.Background(), blobKind)
+				if blobKind == kind {
+					if err != nil || string(blob.Data) != "existing" {
+						t.Fatalf("Init changed existing %s: %q, %v", kind, blob.Data, err)
+					}
+				} else if !errors.Is(err, ErrNotInitialized) {
+					t.Fatalf("Init created unexpected %s blob: %v", blobKind, err)
+				}
+			}
+		})
+	}
+}
+
+func TestInitRejectsWorkFactorsThatCannotBeDecrypted(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "uninitialized"))
+	if _, err := store.Init([]byte("password"), 23); err == nil {
+		t.Fatal("Init accepted a work factor above the decryption limit")
+	}
+	if _, err := os.Stat(store.Dir()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("invalid work factor should be rejected before initialization, got %v", err)
+	}
+}
+
+type vaultAppearsDuringInitBackend struct {
+	BlobBackend
+}
+
+func (b vaultAppearsDuringInitBackend) Save(ctx context.Context, kind BlobKind, blob Blob, opts SaveOptions) (string, error) {
+	version, err := b.BlobBackend.Save(ctx, kind, blob, opts)
+	if err == nil && kind == BlobIdentity {
+		_, err = b.BlobBackend.Save(ctx, BlobVault, Blob{Data: []byte("existing")}, SaveOptions{CreateOnly: true})
+	}
+	return version, err
+}
+
+func TestInitDoesNotOverwriteVaultCreatedConcurrently(t *testing.T) {
+	backend := vaultAppearsDuringInitBackend{BlobBackend: NewFileBackend(t.TempDir())}
+	store := NewStoreWithBackend(backend)
+	if _, err := store.Init([]byte("password"), 14); !errors.Is(err, ErrAlreadyInitialized) {
+		t.Fatalf("Init returned %v, want ErrAlreadyInitialized", err)
+	}
+	blob, err := backend.Load(context.Background(), BlobVault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(blob.Data) != "existing" {
+		t.Fatalf("Init replaced concurrently created vault with %q", blob.Data)
+	}
+}
+
+func TestReloadRecoversFromConflictAndWipesDiscardedSecrets(t *testing.T) {
+	store := NewStore(t.TempDir())
+	password := []byte("password")
+	if _, err := store.Init(password, 14); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Open(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := store.Open(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := first.SetGroup("shared", "TOKEN", []byte("persisted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.SetGroup("shared", "TOKEN", []byte("stale")); err != nil {
+		t.Fatal(err)
+	}
+	discarded := second.file.Groups["shared"]["TOKEN"]
+	if err := second.Save(); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale Save returned %v, want ErrConflict", err)
+	}
+	if err := second.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range discarded {
+		if value != 0 {
+			t.Fatal("Reload did not wipe discarded secrets")
+		}
+	}
+	if got := string(second.file.Groups["shared"]["TOKEN"]); got != "persisted" {
+		t.Fatalf("Reload returned TOKEN = %q, want persisted", got)
+	}
+	if err := second.SetGroup("shared", "TOKEN", []byte("retried")); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Save(); err != nil {
+		t.Fatalf("Save after Reload: %v", err)
+	}
+}
+
+func TestReloadFailurePreservesCurrentContents(t *testing.T) {
+	store := NewStore(t.TempDir())
+	password := []byte("password")
+	if _, err := store.Init(password, 14); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := store.Open(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := opened.SetApp("chat", "TOKEN", []byte("unsaved")); err != nil {
+		t.Fatal(err)
+	}
+	version := opened.vaultVersion
+	if err := os.Remove(filepath.Join(store.Dir(), vaultFileName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Reload(); !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("Reload returned %v, want ErrNotInitialized", err)
+	}
+	if got := string(opened.file.Apps["chat"].Env["TOKEN"]); got != "unsaved" {
+		t.Fatalf("failed Reload changed current TOKEN to %q", got)
+	}
+	if opened.vaultVersion != version {
+		t.Fatal("failed Reload changed the current version")
+	}
+}
 
 const (
 	testGroupRemoteDB = "remotedb"

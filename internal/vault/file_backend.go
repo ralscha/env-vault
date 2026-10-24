@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -28,24 +29,16 @@ func (b *FileBackend) Init(ctx context.Context) error {
 }
 
 func (b *FileBackend) Stat(ctx context.Context, kind BlobKind) (bool, string, error) {
-	if err := ctx.Err(); err != nil {
-		return false, "", err
-	}
-
-	path, err := b.pathFor(kind)
-	if err != nil {
-		return false, "", err
-	}
-
-	info, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
+	blob, err := b.Load(ctx, kind)
+	if errors.Is(err, ErrNotInitialized) {
 		return false, "", nil
 	}
 	if err != nil {
 		return false, "", err
 	}
 
-	return true, fileVersion(info), nil
+	defer Wipe(blob.Data)
+	return true, blob.Version, nil
 }
 
 func (b *FileBackend) Load(ctx context.Context, kind BlobKind) (Blob, error) {
@@ -63,16 +56,21 @@ func (b *FileBackend) Load(ctx context.Context, kind BlobKind) (Blob, error) {
 		}
 		return Blob{}, err
 	}
-
-	// Hold the same lock as Save so the bytes and version always describe the
-	// same file generation. Without it, a rename between ReadFile and Stat can
-	// make an old payload appear current and defeat optimistic concurrency.
+	// Serialize readers with writers because Windows cannot replace an open
+	// file. The content hash also detects updates with identical timestamps.
 	unlock, err := lockFile(path + ".lock")
 	if err != nil {
 		return Blob{}, err
 	}
 	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return Blob{}, err
+	}
+	return loadBlobFile(path)
+}
 
+// loadBlobFile requires the caller to hold the file's lock.
+func loadBlobFile(path string) (Blob, error) {
 	// #nosec G304 -- backend paths are derived from the configured vault directory and blob kind.
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -82,13 +80,7 @@ func (b *FileBackend) Load(ctx context.Context, kind BlobKind) (Blob, error) {
 		return Blob{}, err
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		Wipe(data)
-		return Blob{}, err
-	}
-
-	return Blob{Data: data, Version: fileVersion(info)}, nil
+	return Blob{Data: data, Version: fileVersion(data)}, nil
 }
 
 func (b *FileBackend) Save(ctx context.Context, kind BlobKind, blob Blob, opts SaveOptions) (string, error) {
@@ -110,15 +102,20 @@ func (b *FileBackend) Save(ctx context.Context, kind BlobKind, blob Blob, opts S
 	}
 	defer unlock()
 
-	exists, currentVersion, err := b.Stat(ctx, kind)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	current, err := loadBlobFile(path)
+	if err != nil && !errors.Is(err, ErrNotInitialized) {
+		return "", err
+	}
+	defer Wipe(current.Data)
+	exists := err == nil
 	if opts.CreateOnly && exists {
 		return "", ErrAlreadyInitialized
 	}
 	if opts.ExpectedVersion != "" {
-		if !exists || opts.ExpectedVersion != currentVersion {
+		if !exists || opts.ExpectedVersion != current.Version {
 			return "", ErrConflict
 		}
 	}
@@ -127,11 +124,7 @@ func (b *FileBackend) Save(ctx context.Context, kind BlobKind, blob Blob, opts S
 		return "", err
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", err
-	}
-	return fileVersion(info), nil
+	return fileVersion(blob.Data), nil
 }
 
 func (b *FileBackend) pathFor(kind BlobKind) (string, error) {
@@ -145,8 +138,8 @@ func (b *FileBackend) pathFor(kind BlobKind) (string, error) {
 	}
 }
 
-func fileVersion(info os.FileInfo) string {
-	return fmt.Sprintf("%d-%d", info.ModTime().UnixNano(), info.Size())
+func fileVersion(data []byte) string {
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
 func WriteFileAtomic(path string, contents []byte, perm os.FileMode) (err error) {
@@ -175,6 +168,9 @@ func WriteFileAtomic(path string, contents []byte, perm os.FileMode) (err error)
 		return closeTemp(err)
 	}
 	if err := tmp.Chmod(perm); err != nil {
+		return closeTemp(err)
+	}
+	if err := tmp.Sync(); err != nil {
 		return closeTemp(err)
 	}
 	if err := tmp.Close(); err != nil {

@@ -66,6 +66,7 @@ func LoadInventory(opened *vault.Opened) ([]EntitySummary, error) {
 			}
 			summary.LinkedGroupCount = len(app.Groups)
 			searchParts = append(searchParts, app.Groups...)
+			opened.WipeProfile(app.Env)
 		}
 		summary.SearchText = strings.ToLower(strings.Join(searchParts, " "))
 		items = append(items, summary)
@@ -119,6 +120,7 @@ func LoadDetails(opened *vault.Opened, name string) (EntityDetails, error) {
 		if err != nil {
 			return details, err
 		}
+		defer opened.WipeProfile(app.Env)
 		details.Summary.LinkedGroupCount = len(app.Groups)
 		details.LinkedGroups = append([]string(nil), app.Groups...)
 		details.Direct = keyValuesFromProfile(app.Env, keys)

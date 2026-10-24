@@ -1,14 +1,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 
 	"env-vault/internal/tui"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func main() {
@@ -20,10 +20,12 @@ func main() {
 
 func run(args []string) error {
 	fs := flag.NewFlagSet("env-vault-tui", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
 	dir := fs.String("dir", tui.DefaultVaultDir(), "vault directory")
 	unlock := tui.AddUnlockFlags(fs)
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -44,7 +46,7 @@ func run(args []string) error {
 		return err
 	}
 
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	program := tea.NewProgram(model)
 	_, err = program.Run()
 	return err
 }

@@ -6,6 +6,8 @@ Store named sets of environment variables in a local encrypted vault and inject 
 
 Build from source:
 
+Requires Go 1.27.3 or later.
+
 ```sh
 git clone https://github.com/ralscha/env-vault
 cd env-vault
@@ -40,6 +42,7 @@ Inside the TUI:
 - `l` and `u` link or unlink groups on the selected app.
 - `r`, `y`, and `x` rename, copy, or remove the selected entity.
 - `v` toggles secret visibility in the detail pane.
+- `Ctrl+R` reloads the vault to pick up changes made by another command.
 
 ## Concepts
 
@@ -98,7 +101,7 @@ Create a new vault. Prompts for a master password interactively unless a non-int
 env-vault init [--dir PATH] [--work-factor N] [--password-stdin|--password-file PATH|--password-fd N]
 ```
 
-`--work-factor N` controls the scrypt difficulty (default: 18). Higher values are slower but more resistant to brute force.
+`--work-factor N` controls the scrypt difficulty (default: 18, supported range: 14–22). Higher values are slower but more resistant to brute force.
 
 ```sh
 env-vault init
@@ -134,6 +137,7 @@ env-vault set [shared flags] [--stdin|--interactive] [--app|--group] NAME [KEY [
 - `--stdin` reads the value from stdin (avoids shell history; requires a different unlock source than `--password-stdin`).
 - `--interactive` starts a multi-key edit session in a prompt loop.
 - Passing `VALUE` as a literal argument works but may leak through shell history and process inspection.
+- If a positional argument looks like a flag, place `--` before `NAME`: `env-vault set --app -- chat TOKEN --example`.
 
 ```sh
 # Prompt for the value (safest)
@@ -269,7 +273,7 @@ Display detailed information about one entity or a resolved selection.
 env-vault show [shared flags] [--resolved] [--json] [app|group] NAME[,NAME...]
 ```
 
-- `app` or `group` narrows the lookup when both exist (they cannot, but the qualifier is accepted).
+- `app` or `group` verifies that the selected entity has the requested kind.
 - `--resolved` also prints the merged variable values with per-key provenance (which entity each key came from).
 - `--json` emits machine-readable metadata.
 

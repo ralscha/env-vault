@@ -3,7 +3,6 @@ package vault
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -31,7 +30,8 @@ func (s *SecretValue) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &text); err != nil {
 		return err
 	}
-	*s = append((*s)[:0], []byte(text)...)
+	s.Wipe()
+	*s = append((*s)[:0], text...)
 	return nil
 }
 
@@ -40,9 +40,7 @@ func (s SecretValue) Clone() SecretValue {
 }
 
 func (s SecretValue) Wipe() {
-	for i := range s {
-		s[i] = 0
-	}
+	clear(s)
 }
 
 type Profile map[string]SecretValue
@@ -50,10 +48,6 @@ type Profile map[string]SecretValue
 type EntityMetadata struct {
 	CreatedAt  time.Time `json:"created_at"`
 	ModifiedAt time.Time `json:"modified_at"`
-}
-
-func normalizeMetadata(metadata EntityMetadata) EntityMetadata {
-	return metadata
 }
 
 func (p Profile) Clone() Profile {
@@ -125,13 +119,6 @@ type App struct {
 	Env    Profile  `json:"env"`
 }
 
-type fileDisk struct {
-	Version  int                       `json:"version"`
-	Groups   map[string]Profile        `json:"groups,omitempty"`
-	Apps     map[string]App            `json:"apps,omitempty"`
-	Metadata map[string]EntityMetadata `json:"metadata,omitempty"`
-}
-
 func NewFile() *File {
 	return &File{
 		Version:  currentVersion,
@@ -154,35 +141,25 @@ func (a App) Wipe() {
 }
 
 func LoadFile(data []byte) (*File, error) {
-	disk := fileDisk{}
-	if err := json.Unmarshal(data, &disk); err != nil {
+	file := &File{}
+	if err := json.Unmarshal(data, file); err != nil {
+		file.Wipe()
 		return nil, err
 	}
-	if disk.Version == 0 {
+	if file.Version == 0 {
+		file.Wipe()
 		return nil, fmt.Errorf("missing vault version")
 	}
-	if disk.Version != currentVersion {
-		return nil, fmt.Errorf("unsupported vault version %d", disk.Version)
+	if file.Version != currentVersion {
+		version := file.Version
+		file.Wipe()
+		return nil, fmt.Errorf("unsupported vault version %d", version)
 	}
-	if disk.Groups == nil {
-		disk.Groups = map[string]Profile{}
+	if err := file.Validate(); err != nil {
+		file.Wipe()
+		return nil, err
 	}
-	if disk.Apps == nil {
-		disk.Apps = map[string]App{}
-	}
-	if disk.Metadata == nil {
-		disk.Metadata = map[string]EntityMetadata{}
-	}
-
-	file := NewFile()
-	for name, profile := range disk.Groups {
-		file.Groups[name] = profile.Clone()
-	}
-	for name, app := range disk.Apps {
-		file.Apps[name] = app.Clone()
-	}
-	maps.Copy(file.Metadata, disk.Metadata)
-	return file, file.Validate()
+	return file, nil
 }
 
 func (f *File) Wipe() {
@@ -203,6 +180,7 @@ func (f *File) Wipe() {
 	if f.Metadata == nil {
 		f.Metadata = map[string]EntityMetadata{}
 	}
+	clear(f.Metadata)
 	f.Version = currentVersion
 }
 
@@ -222,25 +200,28 @@ func (f *File) Validate() error {
 			delete(f.Metadata, name)
 			continue
 		}
-		f.Metadata[name] = normalizeMetadata(f.Metadata[name])
 	}
 	for name := range f.Groups {
+		if err := ValidateEntityName(name); err != nil {
+			return fmt.Errorf("group %q: %w", name, err)
+		}
 		if _, ok := f.Apps[name]; ok {
 			return fmt.Errorf("name %q is used by both a group and an app", name)
 		}
+		if f.Groups[name] == nil {
+			f.Groups[name] = Profile{}
+		}
 		if _, ok := f.Metadata[name]; !ok {
 			f.Metadata[name] = EntityMetadata{}
-			continue
 		}
-		f.Metadata[name] = normalizeMetadata(f.Metadata[name])
 	}
 	for appName, app := range f.Apps {
+		if err := ValidateEntityName(appName); err != nil {
+			return fmt.Errorf("app %q: %w", appName, err)
+		}
 		if _, ok := f.Metadata[appName]; !ok {
 			f.Metadata[appName] = EntityMetadata{}
-		} else {
-			f.Metadata[appName] = normalizeMetadata(f.Metadata[appName])
 		}
-		app = app.Clone()
 		seen := make(map[string]struct{}, len(app.Groups))
 		uniqueGroups := make([]string, 0, len(app.Groups))
 		for _, groupName := range app.Groups {
@@ -259,7 +240,7 @@ func (f *File) Validate() error {
 		}
 		for key := range app.Env {
 			if err := ValidateEnvKey(key); err != nil {
-				return err
+				return fmt.Errorf("app %q: %w", appName, err)
 			}
 		}
 		f.Apps[appName] = app
@@ -292,7 +273,7 @@ func (f *File) ensureGroup(name string) Profile {
 	if f.Groups == nil {
 		f.Groups = map[string]Profile{}
 	}
-	if profile, ok := f.Groups[name]; ok {
+	if profile := f.Groups[name]; profile != nil {
 		return profile
 	}
 	profile := Profile{}
@@ -304,7 +285,7 @@ func (f *File) MetadataFor(name string) EntityMetadata {
 	if f.Metadata == nil {
 		f.Metadata = map[string]EntityMetadata{}
 	}
-	return normalizeMetadata(f.Metadata[name])
+	return f.Metadata[name]
 }
 
 func (f *File) TouchEntity(name string, now time.Time) {
@@ -323,7 +304,7 @@ func (f *File) SetMetadata(name string, metadata EntityMetadata) {
 	if f.Metadata == nil {
 		f.Metadata = map[string]EntityMetadata{}
 	}
-	f.Metadata[name] = normalizeMetadata(metadata)
+	f.Metadata[name] = metadata
 }
 
 func (f *File) DeleteMetadata(name string) {

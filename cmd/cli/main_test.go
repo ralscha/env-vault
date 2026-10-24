@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -507,6 +510,84 @@ func TestParseEditableEntity(t *testing.T) {
 
 	if _, err := parseEditableEntity([]byte(`{"keys":{" ":"value"}}`)); err == nil {
 		t.Fatal("expected invalid editable key to fail")
+	}
+}
+
+func TestParseEditableEntityRejectsDestructiveMistakes(t *testing.T) {
+	for _, input := range []string{
+		`{"key":{"TOKEN":"secret"}}`,
+		`{"keys":{"TOKEN":"first"," TOKEN ":"second"}}`,
+		`{"keys":{}} {"keys":{"TOKEN":"secret"}}`,
+		`{"keys":{}} invalid`,
+		`null`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			if _, err := parseEditableEntity([]byte(input)); err == nil {
+				t.Fatal("expected invalid editor content to be rejected")
+			}
+		})
+	}
+}
+
+func TestFlagExtractionPreservesArgumentsAfterSeparator(t *testing.T) {
+	args := []string{"--", "app", "TOKEN", "--group"}
+	filtered, found := extractBoolFlag(args, "--group")
+	if found || !slices.Equal(filtered, args) {
+		t.Fatalf("literal secret was treated as a flag: %#v, %t", filtered, found)
+	}
+	args = []string{"--", "--editor=literal"}
+	filtered, value, err := extractStringFlag(args, "--editor")
+	if err != nil || value != "" || !slices.Equal(filtered, args) {
+		t.Fatalf("literal argument was treated as a flag: %#v, %q, %v", filtered, value, err)
+	}
+}
+
+func TestCLIChildExitHelper(_ *testing.T) {
+	if os.Getenv("ENV_VAULT_TEST_CHILD_EXIT") == "1" {
+		os.Exit(7)
+	}
+}
+
+func TestRunChildProcessReturnsExitError(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G204 -- re-execute this test binary with a fixed helper test.
+	cmd := exec.Command(executable, "-test.run=^TestCLIChildExitHelper$")
+	cmd.Env = append(os.Environ(), "ENV_VAULT_TEST_CHILD_EXIT=1")
+	err = runChildProcess(cmd)
+	exitErr, ok := errors.AsType[*childExitError](err)
+	if !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("runChildProcess() = %v, want child exit code 7", err)
+	}
+}
+
+func TestRunMainPreservesChildExitCode(t *testing.T) {
+	dir := t.TempDir()
+	store := vault.NewStore(filepath.Join(dir, "vault"))
+	password := []byte("test master password")
+	if _, err := store.Init(password, 14); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := store.Open(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if err := opened.SetGroup("test", "ENV_VAULT_TEST_CHILD_EXIT", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Save(); err != nil {
+		t.Fatal(err)
+	}
+	passwordPath := filepath.Join(dir, "password")
+	if err := os.WriteFile(passwordPath, password, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"exec", "--dir", store.Dir(), "--password-file", passwordPath, "test", "--", os.Args[0], "-test.run=^TestCLIChildExitHelper$"}
+	if code := runMain(args); code != 7 {
+		t.Fatalf("runMain() = %d, want child exit code 7", code)
 	}
 }
 

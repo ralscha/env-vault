@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"env-vault/internal/secretio"
 	"env-vault/internal/vault"
 
 	"github.com/awnumar/memguard"
@@ -44,6 +45,9 @@ func (o UnlockOptions) Validate() error {
 }
 
 func OpenStore(dir string, unlock UnlockOptions) (*vault.Opened, error) {
+	if err := unlock.Validate(); err != nil {
+		return nil, err
+	}
 	password, err := readMasterPassword(unlock)
 	if err != nil {
 		return nil, err
@@ -98,6 +102,7 @@ func readMasterPassword(unlock UnlockOptions) ([]byte, error) {
 		return nil, err
 	}
 	password, err := term.ReadPassword(stdinFD)
+	defer vault.Wipe(password)
 	if _, writeErr := fmt.Fprintln(os.Stderr); writeErr != nil && err == nil {
 		err = writeErr
 	}
@@ -127,14 +132,11 @@ func readNonInteractiveMasterPassword(unlock UnlockOptions) ([]byte, error) {
 		}
 		return secret, nil
 	case unlock.PasswordFDSet:
-		passwordFD, err := uintptrFromInt(unlock.PasswordFD)
+		file, err := secretio.DuplicateFD(unlock.PasswordFD)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("open --password-fd %d: %w", unlock.PasswordFD, err)
 		}
-		file := os.NewFile(passwordFD, fmt.Sprintf("fd-%d", unlock.PasswordFD))
-		if file == nil {
-			return nil, fmt.Errorf("open --password-fd %d", unlock.PasswordFD)
-		}
+		defer func() { _ = file.Close() }()
 		return readSecretFromReader(file, fmt.Sprintf("master password from fd %d", unlock.PasswordFD))
 	default:
 		return nil, fmt.Errorf("internal error: no non-interactive unlock source selected")
@@ -160,11 +162,4 @@ func intFromUintptr(value uintptr) (int, error) {
 		return 0, fmt.Errorf("file descriptor %d exceeds platform int size", value)
 	}
 	return int(value), nil
-}
-
-func uintptrFromInt(value int) (uintptr, error) {
-	if value < 0 {
-		return 0, fmt.Errorf("file descriptor must be non-negative")
-	}
-	return uintptr(value), nil
 }
