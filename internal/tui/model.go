@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +56,7 @@ type Model struct {
 	selected     int
 	selectedName string
 	details      EntityDetails
+	detailOffset int
 	revealValues bool
 	status       string
 	form         *formState
@@ -182,9 +184,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.search.Blur()
 				return m, nil
 			}
-			m.search, cmd = m.search.Update(msg)
-			m.applyFilter()
-			return m, cmd
+			return m.updateSearch(msg)
 		}
 		switch typed.String() {
 		case "q":
@@ -195,6 +195,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "down", "j":
 			m.moveSelection(1)
+			return m, nil
+		case "pgup", "pgdown":
+			m.scrollDetails(typed.String() == "pgdown")
 			return m, nil
 		case "/":
 			cmd = m.search.Focus()
@@ -268,16 +271,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		m.search, cmd = m.search.Update(msg)
-		m.applyFilter()
-		return m, cmd
+		return m.updateSearch(msg)
 	}
 
 	if m.form != nil {
 		return m.updateFormInput(msg)
 	}
+	return m.updateSearch(msg)
+}
+
+func (m Model) updateSearch(msg tea.Msg) (tea.Model, tea.Cmd) {
+	previous := m.search.Value()
+	var cmd tea.Cmd
 	m.search, cmd = m.search.Update(msg)
-	m.applyFilter()
+	if m.search.Value() != previous {
+		m.applyFilter()
+	}
 	return m, cmd
 }
 
@@ -616,6 +625,7 @@ func (m *Model) moveSelection(delta int) {
 }
 
 func (m *Model) syncDetails() error {
+	m.detailOffset = 0
 	if m.selectedName == "" {
 		m.details = EntityDetails{}
 		return nil
@@ -651,7 +661,7 @@ func (m Model) renderBody(bodyHeight int) string {
 	left := m.styles.border.Width(leftWidth).Height(bodyHeight).MaxHeight(bodyHeight).
 		Render(m.renderList(leftWidth-4, bodyHeight-2))
 	right := m.styles.selectionBorder.Width(rightWidth).Height(bodyHeight).MaxHeight(bodyHeight).
-		Render(m.renderDetails(bodyHeight - 2))
+		Render(m.renderDetails(rightWidth-4, bodyHeight-2))
 	return lipgloss.NewStyle().Padding(0, 1).Render(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right))
 }
 
@@ -707,7 +717,7 @@ func (m Model) renderList(width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderDetails(height int) string {
+func (m Model) detailContent() string {
 	if !m.hasSelection() {
 		return m.styles.muted.Render("Select an entity to inspect and edit it.")
 	}
@@ -727,8 +737,49 @@ func (m Model) renderDetails(height int) string {
 		sections = append(sections, "", m.styles.section.Render("Linked Groups"), renderLinkedGroups(details.LinkedGroups, m.styles))
 		sections = append(sections, "", m.styles.section.Render("Resolved Preview"), renderKeyValues(details.Resolved, m.revealValues, m.styles))
 	}
-	content := strings.Join(sections, "\n")
-	return truncateLines(content, height)
+	return strings.Join(sections, "\n")
+}
+
+func (m Model) detailLines(width int) []string {
+	content := lipgloss.NewStyle().Width(max(1, width)).Render(m.detailContent())
+	return strings.Split(content, "\n")
+}
+
+func (m Model) renderDetails(width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := m.detailLines(width)
+	if len(lines) <= height {
+		return strings.Join(lines, "\n")
+	}
+	limit := max(1, height-1)
+	start := min(m.detailOffset, len(lines)-limit)
+	visible := strings.Join(lines[start:start+limit], "\n")
+	if height > 1 {
+		visible += "\n" + m.styles.muted.Render(fmt.Sprintf("%d-%d/%d", start+1, start+limit, len(lines)))
+	}
+	return visible
+}
+
+func (m *Model) scrollDetails(down bool) {
+	leftWidth := max(12, min(40, m.width/3))
+	width := max(12, m.width-leftWidth-3) - 4
+	bodyHeight := max(3, m.height-lipgloss.Height(m.renderHeader())-lipgloss.Height(m.renderFooter()))
+	height := bodyHeight - 2
+	lines := m.detailLines(width)
+	if len(lines) <= height {
+		m.detailOffset = 0
+		return
+	}
+	step := max(1, height-1)
+	last := max(0, len(lines)-step)
+	m.detailOffset = min(m.detailOffset, last)
+	if down {
+		m.detailOffset = min(last, m.detailOffset+step)
+	} else {
+		m.detailOffset = max(0, m.detailOffset-step)
+	}
 }
 
 func (m Model) renderForm() string {
@@ -954,6 +1005,7 @@ func (m Model) contextActions() []actionItem {
 		{key: "X", label: "remove"},
 		{key: "V", label: toggleLabel(m.revealValues)},
 		{key: "Ctrl+R", label: "refresh"},
+		{key: "PgUp/PgDn", label: "scroll details"},
 	}
 	if m.details.Summary.Kind == vault.EntityKindApp {
 		actions = append(actions,
@@ -983,7 +1035,9 @@ func renderKeyValues(values []KeyValue, reveal bool, styles styles) string {
 	for _, pair := range values {
 		value := maskValue(pair.Value)
 		if reveal {
-			value = pair.Value
+			// Escape terminal controls and line breaks without changing stored data.
+			quoted := strconv.Quote(pair.Value)
+			value = quoted[1 : len(quoted)-1]
 		}
 		lines = append(lines, fmt.Sprintf("%s = %s", pair.Key, styles.value.Render(value)))
 	}
@@ -1117,22 +1171,6 @@ func formatTimestampLine(createdAt, modifiedAt time.Time) string {
 		return ""
 	}
 	return strings.Join(parts, " • ")
-}
-
-func truncateLines(content string, maxLines int) string {
-	if maxLines <= 0 {
-		return ""
-	}
-	lines := strings.Split(content, "\n")
-	if len(lines) <= maxLines {
-		return content
-	}
-	if maxLines < 2 {
-		return strings.Join(lines[:maxLines], "\n")
-	}
-	trimmed := append([]string(nil), lines[:maxLines-1]...)
-	trimmed = append(trimmed, "...")
-	return strings.Join(trimmed, "\n")
 }
 
 func maskValue(value string) string {

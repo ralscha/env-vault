@@ -1,12 +1,14 @@
 package vault
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const currentVersion = 1
@@ -22,10 +24,16 @@ const (
 type SecretValue []byte
 
 func (s SecretValue) MarshalJSON() ([]byte, error) {
+	if err := ValidateEnvValue(s); err != nil {
+		return nil, err
+	}
 	return json.Marshal(string(s))
 }
 
 func (s *SecretValue) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return fmt.Errorf("environment variable values must be strings")
+	}
 	var text string
 	if err := json.Unmarshal(data, &text); err != nil {
 		return err
@@ -87,9 +95,24 @@ func ValidateEnvKey(key string) error {
 	return nil
 }
 
+// ValidateEnvValue rejects data that JSON would change or a process environment
+// cannot represent. Errors deliberately omit the secret value.
+func ValidateEnvValue(value []byte) error {
+	if !utf8.Valid(value) {
+		return fmt.Errorf("environment variable values must be valid UTF-8")
+	}
+	if bytes.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("environment variable values cannot contain NUL bytes")
+	}
+	return nil
+}
+
 // ValidateEntityName keeps names compatible with comma-separated selections
 // and safe to render in terminal-oriented clients.
 func ValidateEntityName(name string) error {
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("entity names must be valid UTF-8")
+	}
 	if name == "" {
 		return fmt.Errorf("entity names cannot be empty")
 	}
@@ -141,6 +164,9 @@ func (a App) Wipe() {
 }
 
 func LoadFile(data []byte) (*File, error) {
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("vault data must be valid UTF-8")
+	}
 	file := &File{}
 	if err := json.Unmarshal(data, file); err != nil {
 		file.Wipe()
@@ -238,17 +264,23 @@ func (f *File) Validate() error {
 		if app.Env == nil {
 			app.Env = Profile{}
 		}
-		for key := range app.Env {
+		for key, value := range app.Env {
 			if err := ValidateEnvKey(key); err != nil {
 				return fmt.Errorf("app %q: %w", appName, err)
+			}
+			if err := ValidateEnvValue(value); err != nil {
+				return fmt.Errorf("app %q key %q: %w", appName, key, err)
 			}
 		}
 		f.Apps[appName] = app
 	}
 	for groupName, profile := range f.Groups {
-		for key := range profile {
+		for key, value := range profile {
 			if err := ValidateEnvKey(key); err != nil {
 				return fmt.Errorf("group %q: %w", groupName, err)
+			}
+			if err := ValidateEnvValue(value); err != nil {
+				return fmt.Errorf("group %q key %q: %w", groupName, key, err)
 			}
 		}
 	}

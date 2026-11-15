@@ -305,3 +305,42 @@ func TestNewModelStartsWithSearchBlurred(t *testing.T) {
 		t.Fatal("expected search to start blurred")
 	}
 }
+
+func TestRevealedValuesEscapeTerminalControls(t *testing.T) {
+	values := []KeyValue{{Key: "TOKEN", Value: "line1\nline2\r\t\x1b]52;c;payload\a"}}
+	rendered := renderKeyValues(values, true, styles{})
+	if strings.ContainsAny(rendered, "\n\r\t\x1b\a") {
+		t.Fatalf("revealed value emitted terminal controls: %q", rendered)
+	}
+	if !strings.Contains(rendered, `line1\nline2\r\t\x1b]52;c;payload\a`) {
+		t.Fatalf("escaped value is not readable: %q", rendered)
+	}
+}
+
+func TestDetailsScrollToLastKey(t *testing.T) {
+	model := Model{
+		width: 100, height: 24, search: textinput.New(), styles: defaultStyles(),
+		selectedName: "many",
+		details:      EntityDetails{Summary: EntitySummary{Name: "many", Kind: vault.EntityKindGroup}},
+	}
+	for i := range 50 {
+		model.details.Direct = append(model.details.Direct, KeyValue{Key: fmt.Sprintf("KEY_%02d", i), Value: "value"})
+	}
+	if strings.Contains(model.renderView(), "KEY_49") {
+		t.Fatal("last key should initially be off screen")
+	}
+	for range 100 {
+		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+		model = updated.(Model)
+	}
+	if model.detailOffset == 0 || !strings.Contains(model.renderView(), "KEY_49") {
+		t.Fatal("Page Down must make the last key reachable")
+	}
+	for range 100 {
+		updated, _ := model.Update(tea.KeyPressMsg{Code: tea.KeyPgUp})
+		model = updated.(Model)
+	}
+	if model.detailOffset != 0 || !strings.Contains(model.renderView(), "KEY_00") {
+		t.Fatal("Page Up must return to the first key")
+	}
+}

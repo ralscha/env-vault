@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"env-vault/internal/secretio"
 	"env-vault/internal/vault"
@@ -89,6 +90,12 @@ func runMain(args []string) int {
 	defer memguard.Purge()
 
 	if err := run(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			if err := printUsage(os.Stdout); err != nil {
+				return 1
+			}
+			return 0
+		}
 		if exitErr, ok := errors.AsType[*childExitError](err); ok {
 			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 				return 128 + int(status.Signal())
@@ -425,8 +432,8 @@ func completionFlags() map[string][]string {
 func renderBashCompletion(commands []string, subcommands map[string][]string, flags map[string][]string) string {
 	var builder strings.Builder
 	builder.WriteString("_env_vault_completion() {\n")
-	builder.WriteString("  local cur prev words cword\n")
-	builder.WriteString("  _init_completion -n : || return\n")
+	builder.WriteString("  local cur=\"${COMP_WORDS[COMP_CWORD]}\" cword=$COMP_CWORD\n")
+	builder.WriteString("  local -a words=(\"${COMP_WORDS[@]}\")\n")
 	builder.WriteString("  local commands=\"")
 	builder.WriteString(strings.Join(commands, " "))
 	builder.WriteString("\"\n")
@@ -503,7 +510,8 @@ func renderFishCompletion(commands []string, subcommands map[string][]string, fl
 		builder.WriteString(command)
 		builder.WriteString("'\n")
 	}
-	for command, options := range flags {
+	for _, command := range commands {
+		options := flags[command]
 		for _, option := range options {
 			builder.WriteString("complete -c env-vault -n '__fish_seen_subcommand_from ")
 			builder.WriteString(command)
@@ -512,7 +520,8 @@ func renderFishCompletion(commands []string, subcommands map[string][]string, fl
 			builder.WriteString("\n")
 		}
 	}
-	for command, values := range subcommands {
+	for _, command := range commands {
+		values := subcommands[command]
 		for _, value := range values {
 			builder.WriteString("complete -c env-vault -n '__fish_seen_subcommand_from ")
 			builder.WriteString(command)
@@ -528,7 +537,8 @@ func renderPowerShellCompletion(commands []string, subcommands map[string][]stri
 	var builder strings.Builder
 	builder.WriteString("Register-ArgumentCompleter -Native -CommandName env-vault -ScriptBlock {\n")
 	builder.WriteString("  param($wordToComplete, $commandAst, $cursorPosition)\n")
-	builder.WriteString("  $tokens = $commandAst.CommandElements | ForEach-Object { $_.Extent.Text }\n")
+	builder.WriteString("  $elements = @($commandAst.CommandElements | Where-Object { $_.Extent.StartOffset -lt $cursorPosition })\n")
+	builder.WriteString("  $tokens = @($elements | ForEach-Object { $_.Extent.Text })\n")
 	builder.WriteString("  $commands = @(")
 	for index, command := range commands {
 		if index > 0 {
@@ -539,7 +549,7 @@ func renderPowerShellCompletion(commands []string, subcommands map[string][]stri
 		builder.WriteString("'")
 	}
 	builder.WriteString(")\n")
-	builder.WriteString("  if ($tokens.Count -le 1) {\n")
+	builder.WriteString("  if ($tokens.Count -le 1 -or ($tokens.Count -eq 2 -and $cursorPosition -le $elements[1].Extent.EndOffset)) {\n")
 	builder.WriteString("    $commands | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }\n")
 	builder.WriteString("    return\n")
 	builder.WriteString("  }\n")
@@ -1351,21 +1361,22 @@ func runExec(args []string) error {
 			break
 		}
 	}
-	if separator == -1 {
-		return fmt.Errorf("usage: env-vault exec [--dir PATH] NAME[,NAME...] -- COMMAND [ARGS...]")
+	parseArgs := args
+	if separator != -1 {
+		parseArgs = args[:separator]
 	}
 
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	dir := fs.String("dir", defaultVaultDir(), "vault directory")
 	unlock := addUnlockFlags(fs)
-	if err := fs.Parse(args[:separator]); err != nil {
+	if err := fs.Parse(parseArgs); err != nil {
 		return err
 	}
 	if err := unlock.Validate(); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if separator == -1 || fs.NArg() != 1 {
 		return fmt.Errorf("usage: env-vault exec [--dir PATH] NAME[,NAME...] -- COMMAND [ARGS...]")
 	}
 
@@ -2051,7 +2062,12 @@ func renderEditableEntity(entity editableMetadata) ([]byte, error) {
 }
 
 func parseEditableEntity(data []byte) (editableMetadata, error) {
-	var metadata *editableMetadata
+	if !utf8.Valid(data) {
+		return editableMetadata{}, fmt.Errorf("edited metadata must be valid UTF-8")
+	}
+	var metadata *struct {
+		Keys map[string]*string `json:"keys"`
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&metadata); err != nil {
@@ -2063,12 +2079,21 @@ func parseEditableEntity(data []byte) (editableMetadata, error) {
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return editableMetadata{}, fmt.Errorf("edited metadata must contain exactly one JSON object")
 	}
-	keys, err := normalizeEditableKeys(metadata.Keys)
+	if metadata.Keys == nil {
+		return editableMetadata{}, fmt.Errorf("edited metadata must contain a keys object; use \"keys\": {} to remove all keys")
+	}
+	values := make(map[string]string, len(metadata.Keys))
+	for key, value := range metadata.Keys {
+		if value == nil {
+			return editableMetadata{}, fmt.Errorf("edited key %q must have a string value", key)
+		}
+		values[key] = *value
+	}
+	keys, err := normalizeEditableKeys(values)
 	if err != nil {
 		return editableMetadata{}, err
 	}
-	metadata.Keys = keys
-	return *metadata, nil
+	return editableMetadata{Keys: keys}, nil
 }
 
 func normalizeEditableKeys(keys map[string]string) (map[string]string, error) {
@@ -2080,6 +2105,9 @@ func normalizeEditableKeys(keys map[string]string) (map[string]string, error) {
 		key = strings.TrimSpace(key)
 		if err := vault.ValidateEnvKey(key); err != nil {
 			return nil, err
+		}
+		if err := vault.ValidateEnvValue([]byte(value)); err != nil {
+			return nil, fmt.Errorf("edited key %q: %w", key, err)
 		}
 		if _, exists := normalized[key]; exists {
 			return nil, fmt.Errorf("duplicate edited key after trimming whitespace: %s", key)

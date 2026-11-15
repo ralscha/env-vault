@@ -515,6 +515,11 @@ func TestParseEditableEntity(t *testing.T) {
 
 func TestParseEditableEntityRejectsDestructiveMistakes(t *testing.T) {
 	for _, input := range []string{
+		`{}`,
+		`{"keys":null}`,
+		`{"keys":{"TOKEN":null}}`,
+		`{"keys":{"TOKEN":"secret\u0000value"}}`,
+		"{\"keys\":{\"TOKEN\":\"\xff\"}}",
 		`{"key":{"TOKEN":"secret"}}`,
 		`{"keys":{"TOKEN":"first"," TOKEN ":"second"}}`,
 		`{"keys":{}} {"keys":{"TOKEN":"secret"}}`,

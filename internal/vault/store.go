@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -189,6 +190,9 @@ func (s *Store) openWithIdentityHandle(handle *ageIdentityHandle) (*Opened, erro
 }
 
 func (o *Opened) Save() error {
+	if o.identity == nil {
+		return fmt.Errorf("vault is closed")
+	}
 	if err := o.file.Validate(); err != nil {
 		return err
 	}
@@ -223,6 +227,9 @@ func (o *Opened) SetGroup(groupName, key string, value []byte) error {
 	if err := ValidateEnvKey(key); err != nil {
 		return err
 	}
+	if err := ValidateEnvValue(value); err != nil {
+		return fmt.Errorf("key %q: %w", key, err)
+	}
 	now := time.Now().UTC()
 	if o.file.Kind(groupName) == EntityKindApp {
 		return fmt.Errorf("%w: %s is an app", ErrNameInUse, groupName)
@@ -242,6 +249,9 @@ func (o *Opened) SetApp(appName, key string, value []byte) error {
 	}
 	if err := ValidateEnvKey(key); err != nil {
 		return err
+	}
+	if err := ValidateEnvValue(value); err != nil {
+		return fmt.Errorf("key %q: %w", key, err)
 	}
 	now := time.Now().UTC()
 	if o.file.Kind(appName) == EntityKindGroup {
@@ -537,26 +547,26 @@ func (o *Opened) ResolveSelection(spec string) (Profile, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Resolve references first, then clone only the winning values. This avoids
+	// allocating secret buffers for every intermediate group override.
 	resolved := Profile{}
 	for _, name := range names {
 		switch o.file.Kind(name) {
 		case EntityKindGroup:
-			mergeProfile(resolved, o.file.Groups[name])
+			maps.Copy(resolved, o.file.Groups[name])
 		case EntityKindApp:
 			app := o.file.Apps[name]
 			for _, groupName := range app.Groups {
-				mergeProfile(resolved, o.file.Groups[groupName])
+				maps.Copy(resolved, o.file.Groups[groupName])
 			}
-			mergeProfile(resolved, app.Env)
+			maps.Copy(resolved, app.Env)
 		case EntityKindUnknown:
-			resolved.Wipe()
 			return nil, fmt.Errorf("%w: %s", ErrNameNotFound, name)
 		default:
-			resolved.Wipe()
 			return nil, fmt.Errorf("%w: %s", ErrNameNotFound, name)
 		}
 	}
-	return resolved, nil
+	return resolved.Clone(), nil
 }
 
 func (o *Opened) SelectionKinds(spec string) (map[string]EntityKind, error) {
@@ -592,15 +602,6 @@ func ParseSelection(spec string) ([]string, error) {
 	return names, nil
 }
 
-func mergeProfile(dst Profile, src Profile) {
-	for key, value := range src {
-		if existing, ok := dst[key]; ok {
-			existing.Wipe()
-		}
-		dst[key] = value.Clone()
-	}
-}
-
 func (o *Opened) WipeProfile(profile Profile) {
 	profile.Wipe()
 }
@@ -616,7 +617,7 @@ func (o *Opened) Close() {
 }
 
 func (s *Store) saveFile(ctx context.Context, file *File, identity *age.HybridIdentity, opts SaveOptions) (string, error) {
-	plaintext, err := json.MarshalIndent(file, "", "  ")
+	plaintext, err := json.Marshal(file)
 	if err != nil {
 		return "", err
 	}

@@ -43,6 +43,9 @@ Inside the TUI:
 - `r`, `y`, and `x` rename, copy, or remove the selected entity.
 - `v` toggles secret visibility in the detail pane.
 - `Ctrl+R` reloads the vault to pick up changes made by another command.
+- `Page Up` and `Page Down` scroll long detail panes, including wrapped values and resolved previews.
+
+Revealed values display line breaks and terminal control characters as escaped text.
 
 ## Concepts
 
@@ -51,6 +54,8 @@ Inside the TUI:
 Both apps and groups live in one flat namespace — names must be unique across both kinds.
 
 Names may contain spaces, but not leading or trailing whitespace, commas, or control characters. Commas are reserved for selections.
+
+Names and values must be valid UTF-8. Values may be empty or contain line breaks, but cannot contain NUL bytes, which process environments cannot represent.
 
 **Selections** are comma-separated lists of app and/or group names. They are merged left to right: later entries override earlier ones. Within an app, group values are applied in link order, then the app's own variables are applied last.
 
@@ -298,6 +303,8 @@ env-vault edit [shared flags] [--editor PATH] NAME
 ```
 
 The editor receives a temporary plaintext file. The file is removed after the editor exits. Treat `edit` like `export` from a local-exposure standpoint — plaintext values are on disk while the editor is open.
+
+The document must contain a `keys` object with string values, for example `{"keys":{"TOKEN":"secret"}}`. Use `{"keys":{}}` to explicitly remove all direct keys. Missing or null `keys`, and null values, are rejected.
 
 ```sh
 env-vault edit chat
